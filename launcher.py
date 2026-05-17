@@ -30,8 +30,11 @@ PROCS = {
     "input": str(ROOT / "input_service.py"),
     "mcp": str(ROOT / "mcp_server.py"),
     "telegram": str(ROOT / "telegram_bot.py"),
+    # Watchdog auto session health (17/05) : surveille fin de session ACC + audit MoTeC/Results/perf/DB.
+    # Toast Windows + alert file Desktop si issue. Dan n'a rien à vérifier manuellement.
+    "session_health": str(ROOT / "session_health_watchdog.py"),
 }
-SPAWN_ORDER = ["core", "playback", "input", "mcp", "telegram"]
+SPAWN_ORDER = ["core", "playback", "input", "mcp", "telegram", "session_health"]
 
 # Anti restart-storm config
 MAX_RESTARTS_WINDOW = 5      # max crashes
