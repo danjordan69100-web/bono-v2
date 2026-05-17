@@ -90,7 +90,7 @@ def _fmt_lap(ms) -> str:
 # ============================================================
 @bono_tool(
     name="query_telemetry",
-    description="Get COMPACT live ACC telemetry summary (~20 essential fields, <500 tokens). Use whenever you need live car data.",
+    description="Get COMPACT live ACC telemetry summary (~20 essential fields). USE WHEN you need values FRESHER than the system context snapshot (during long turns >10s when telemetry may have moved). DON'T USE for static info already in system context (track, car, best_lap, current_fuel) — those are pre-injected in fat context.",
     parameters={"type": "object", "properties": {}, "required": []}
 )
 def query_telemetry() -> dict:
@@ -233,7 +233,7 @@ def query_fuel_for_session_plan(session_type: str, duration_min: float, track: s
 # ============================================================
 @bono_tool(
     name="query_tire_state",
-    description="Get current tyre pressures, temperatures, wear with quick assessment (in optimal window or not for Pirelli DHF GT3). Use when driver asks pneus / tyres status.",
+    description="Get DETAILED tyre state per wheel (pressure, temp, wear, optimal window assessment). USE WHEN driver asks 'how are the tyres ?' or after tyre_cliff event. DON'T USE for the global tyre temps/pressures avg already in fat context. Get current tyre pressures, temperatures, wear with quick assessment (in optimal window or not for Pirelli DHF GT3). Use when driver asks pneus / tyres status.",
     parameters={"type": "object", "properties": {}, "required": []}
 )
 def query_tire_state() -> dict:
@@ -291,7 +291,7 @@ def query_tire_state() -> dict:
 # ============================================================
 @bono_tool(
     name="query_opponents",
-    description="Get nearby opponents (gap ahead, gap behind in ms). Use when driver asks who's behind/ahead, gap, position.",
+    description="Get nearby opponents (gap ahead/behind in ms + opponent IDs). USE WHEN driver asks 'who is behind/ahead', or for strategic call. DON'T USE for the simple gap values already in fat context (gap_ahead, gap_behind). Get nearby opponents (gap ahead, gap behind in ms). Use when driver asks who's behind/ahead, gap, position.",
     parameters={"type": "object", "properties": {}, "required": []}
 )
 def query_opponents() -> dict:
@@ -336,7 +336,7 @@ def query_weather() -> dict:
 # ============================================================
 @bono_tool(
     name="query_session_state",
-    description="Get session-level info: type (Practice/Qualify/Race), status (OFF/LIVE/REPLAY/PAUSE), time left, completed laps, flags.",
+    description="Get session info: type, status, time left, completed laps, position. DON'T USE if you just need track/car/session_type/best_lap (those are in fat context). USE WHEN driver asks 'how much time left ?' or status changed recently. Get session info: type, status, time left, completed laps, flags.",
     parameters={"type": "object", "properties": {}, "required": []}
 )
 def query_session_state() -> dict:
@@ -997,8 +997,48 @@ def query_driving_trace(n: int = 6) -> dict:
 
 
 @bono_tool(
+    name="query_setup_context",
+    description="ONE-SHOT fat tool (fix F5 17/05). Returns CAR knowledge + TRACK knowledge + COMBO hints in a single call. Use this INSTEAD of calling query_car_knowledge + query_track_knowledge + query_combo_setup_hints separately (audit 17/05 a observé des chaînes de 10 tool calls inutiles). Auto-detects car/track from SHM if not specified.",
+    parameters={"type": "object", "properties": {
+        "car_id": {"type": "string", "description": "Optional override (default: SHM current)"},
+        "track_id": {"type": "string", "description": "Optional override (default: SHM current)"},
+    }, "required": []}
+)
+def query_setup_context(car_id: str = "", track_id: str = "") -> dict:
+    """Fat tool — fusion car KB + track KB + combo hints. F5 17/05 audit."""
+    from tools.acc_knowledge import get_car_knowledge, get_track_knowledge, get_combo_hint, all_known_cars, all_known_tracks
+    s = _snap()
+    car = car_id or (s.get("car") or "").strip()
+    track = track_id or (s.get("track") or "").strip()
+    out = {"car_id": car, "track_id": track}
+    if car:
+        car_kb = get_car_knowledge(car)
+        if car_kb:
+            out["car_knowledge"] = car_kb
+        else:
+            out["car_unknown"] = f"Car '{car}' not in KB. Known: {', '.join(all_known_cars()[:8])}..."
+    if track:
+        track_kb = get_track_knowledge(track)
+        if track_kb:
+            out["track_knowledge"] = track_kb
+        else:
+            out["track_unknown"] = f"Track '{track}' not in KB. Known: {', '.join(all_known_tracks()[:8])}..."
+    if car and track:
+        combo = get_combo_hint(car, track)
+        if combo:
+            out["combo_hints"] = combo
+        else:
+            out["combo_note"] = "No specific combo entry — LLM should synthesize car_knowledge + track_knowledge."
+    if not car and not track:
+        return _err("no_car_no_track", "Ni car ni track détectés (SHM off ou aucun override).", retryable=True)
+    return _ok(out)
+
+
+# Tools legacy (deprecated mais conservés pour backward compat des prompts existants).
+# Le LLM devrait préférer query_setup_context (1 call) à ces 3 (jusqu'à 3 calls + overhead).
+@bono_tool(
     name="query_car_knowledge",
-    description="V3.K : returns car-specific engineering knowledge (BB range, TC/ABS typical, tyre pressure target, ARB pref, strengths/weaknesses, setup notes). MUST be called before any car-specific advice on setup or driving style.",
+    description="[LEGACY — préfère query_setup_context qui retourne car+track+combo en 1 call]. Returns car-specific engineering knowledge (BB range, TC/ABS, tyre target, ARB pref, strengths/weaknesses).",
     parameters={"type": "object", "properties": {
         "car_id": {"type": "string", "description": "ACC car identifier (e.g. ferrari_488_gt3_evo). Optional — uses current SHM car if absent."},
     }, "required": []}
@@ -1016,7 +1056,7 @@ def query_car_knowledge(car_id: str = "") -> dict:
 
 @bono_tool(
     name="query_track_knowledge",
-    description="V3.L : returns track-specific knowledge (DF preference, brake events, kerb usage, tyre stress zones, pit_loss, weather volatility). MUST be called before any track-specific advice.",
+    description="[LEGACY — préfère query_setup_context qui retourne car+track+combo en 1 call]. Returns track-specific knowledge (DF preference, brake events, kerb usage, tyre stress zones, pit_loss).",
     parameters={"type": "object", "properties": {
         "track_id": {"type": "string", "description": "ACC track identifier (e.g. spa, monza). Optional — uses current SHM track if absent."},
     }, "required": []}
@@ -1034,7 +1074,7 @@ def query_track_knowledge(track_id: str = "") -> dict:
 
 @bono_tool(
     name="query_combo_setup_hints",
-    description="V3.M : returns car+track specific setup hints (wing_target, BB_target, ARB targets, advice). High-value insight when available, fallback to car/track separate KB if no combo entry.",
+    description="[LEGACY — préfère query_setup_context qui retourne car+track+combo en 1 call]. Returns car+track specific setup hints (wing_target, BB_target, ARB targets).",
     parameters={"type": "object", "properties": {
         "car_id": {"type": "string"}, "track_id": {"type": "string"},
     }, "required": []}

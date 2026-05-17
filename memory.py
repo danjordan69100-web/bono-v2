@@ -285,6 +285,37 @@ def log_audio_metric(session_id: int, turn_id: int, duration_s: float, rms: floa
         c.commit(); c.close()
 
 
+def update_pipeline_timing_tts(session_id: int, turn_id: int, tts_ms: int, playback_ms: int, tts_provider: str = ""):
+    """Fix F7 17/05 : UPDATE la ligne pipeline_timings la plus récente pour ce (session_id, turn_id)
+    avec les timings TTS + playback mesurés côté playback_service (cross-service via play.status event)."""
+    with _lock:
+        c = get_conn()
+        c.execute("""UPDATE pipeline_timings SET tts_ms=?, playback_ms=?, tts_provider=COALESCE(NULLIF(?,''), tts_provider)
+                     WHERE id = (SELECT id FROM pipeline_timings WHERE session_id=? AND turn_id=? ORDER BY id DESC LIMIT 1)""",
+                  (tts_ms, playback_ms, tts_provider, session_id, turn_id))
+        c.commit(); c.close()
+
+
+def log_system_snapshot(session_id: int, event_id: int, snap: dict):
+    """Fix F3 17/05 : table système 'system_snapshot_at_event' existait mais aucune fonction
+    n'écrivait dedans. Cette function persiste l'état véhicule au moment où un event fire
+    (corrélation event ↔ state pour le post-session debrief : 'à quoi ressemblait la voiture
+    quand le yellow_flag a fired ?')."""
+    with _lock:
+        c = get_conn()
+        c.execute("""INSERT INTO system_snapshot_at_event(ts,session_id,event_id,speed_kmh,rpm,gear,position,lap,fuel_l,tyre_press_avg,tyre_temp_avg) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                  (time.time(), session_id, event_id,
+                   snap.get("speed_kmh", 0) or 0,
+                   snap.get("rpm", 0) or 0,
+                   snap.get("gear", 0) or 0,
+                   snap.get("position", 0) or 0,
+                   snap.get("completed_laps", 0) or 0,
+                   snap.get("fuel_l", 0.0) or 0.0,
+                   round(sum(snap.get(f"tyre_press_{p}", 0) for p in ("fl","fr","rl","rr")) / 4, 2),
+                   round(sum(snap.get(f"tyre_temp_{p}", 0) for p in ("fl","fr","rl","rr")) / 4, 1)))
+        c.commit(); c.close()
+
+
 def start_session(track: str, car: str, session_type: str) -> int:
     with _lock:
         c = get_conn()
@@ -385,12 +416,15 @@ def log_exchange(session_id: int, driver_msg: str, bono_msg: str,
         c.commit(); c.close()
 
 
-def log_event(session_id: int, type_: str, severity: str = "info", payload: dict | None = None):
+def log_event(session_id: int, type_: str, severity: str = "info", payload: dict | None = None) -> int:
+    """Returns event_id of the inserted row (used by log_system_snapshot for corrélation)."""
     with _lock:
         c = get_conn()
-        c.execute("INSERT INTO events(ts,session_id,type,severity,payload) VALUES (?,?,?,?,?)",
-                  (time.time(), session_id, type_, severity, json.dumps(payload or {})))
+        cur = c.execute("INSERT INTO events(ts,session_id,type,severity,payload) VALUES (?,?,?,?,?)",
+                        (time.time(), session_id, type_, severity, json.dumps(payload or {})))
+        event_id = cur.lastrowid
         c.commit(); c.close()
+        return event_id
 
 
 def log_cost(model: str, tokens_in: int, tokens_out: int, cost_usd: float):

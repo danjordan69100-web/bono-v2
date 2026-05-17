@@ -451,9 +451,15 @@ def main():
                 try:
                     send_json(pub_events, "play.status", {"state": "synthesizing", "text": text[:80], "turn_id": turn_id, "provider": TTS_PROVIDER})
                 except Exception: pass
+                # Fix F7 17/05 : instrumentation TTS_ms + playback_ms cross-service.
+                # Avant ce fix : pipeline_timings.tts_ms=0 et playback_ms=NULL hardcodés.
+                # Maintenant : on mesure, on émet via play.status final pour que core_service
+                # mette à jour la ligne pipeline_timings du turn_id.
+                _t_tts0 = time.time()
                 mp3 = synthesize(text, voice_override=voice_override, mood=mood)
+                _tts_ms = int((time.time() - _t_tts0) * 1000)
                 if not mp3:
-                    try: send_json(pub_events, "play.status", {"state": "synth_fail", "text": text[:80]})
+                    try: send_json(pub_events, "play.status", {"state": "synth_fail", "text": text[:80], "turn_id": turn_id, "tts_ms": _tts_ms})
                     except Exception: pass
                     continue
                 # Re-check invalidation after synth (could be cancelled during fish call)
@@ -469,8 +475,17 @@ def main():
                     continue
                 try: send_json(pub_events, "play.status", {"state": "playing", "text": text[:80], "size": len(mp3), "turn_id": turn_id})
                 except Exception: pass
+                _t_play0 = time.time()
                 ok = play_mp3_blocking(mp3, device=payload.get("device", "Casque"))
-                try: send_json(pub_events, "play.status", {"state": "done" if ok else "play_fail", "text": text[:80], "turn_id": turn_id})
+                _playback_ms = int((time.time() - _t_play0) * 1000)
+                # Émission play.done avec timings — core_service écoutera pour MAJ pipeline_timings.
+                try:
+                    send_json(pub_events, "play.status", {
+                        "state": "done" if ok else "play_fail",
+                        "text": text[:80], "turn_id": turn_id,
+                        "tts_ms": _tts_ms, "playback_ms": _playback_ms,
+                        "provider": TTS_PROVIDER,
+                    })
                 except Exception: pass
             # NB: play.stop est traité dans la phase 1 (drain), pas ici (la queue ne contient que play.text)
     except KeyboardInterrupt:

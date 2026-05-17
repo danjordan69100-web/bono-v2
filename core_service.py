@@ -62,7 +62,6 @@ class State:
     last_logged_lap = 0
     # V3.F : sector tracking (live S1/S2/S3 from sector_index transitions)
     last_sector_index = 0
-    sector_start_ts = 0.0
     current_lap_sectors: list = []  # [s1_ms, s2_ms, s3_ms] for current lap, reset on new lap
     # V3.O : driving trace accumulator (resets each sector)
     sector_speed_min: float = 1e9
@@ -84,7 +83,6 @@ class State:
     session_meta_filled: bool = False
     # V4 tracking — pour opponent pit detection, U/O patterns, rain history, sector deltas
     last_seen_opponents: dict = None  # {car_id: (last_ts, last_pos_xz)}
-    last_sector_completed_at: float = 0.0
     last_known_rain_in_10: int = 0
     last_known_rain_in_30: int = 0
     last_uo_event_ts: float = 0.0
@@ -96,7 +94,6 @@ class State:
     out_lap_announced_lap: int = -1
     warmup_complete_announced: bool = False
     last_position: int = -1
-    last_gap_ahead_ms: int = 0
     last_gap_behind_ms: int = 0
     last_gap_behind_ts: float = 0.0
     chequered_announced: bool = False
@@ -393,15 +390,18 @@ def hysteresis_check(event_type: str, condition: bool,
     return True
 
 
-# Events qu'on RESET sur transition session/pit-exit. Liste blanche : on évite de toucher
-# aux events transients (yellow_flag, traffic_on_push_lap, spotter_close) dont l'exit_condition
-# gère déjà le re-fire correctement, et aux events idempotents (lap_completed, personal_best).
-# Cible : warnings actionnables one-shot par session/stint.
-_LATCHES_RESET_ON_SESSION_CHANGE = {
-    "fuel_warning", "fuel_critical", "tyre_cliff",
-    "brake_temp_high", "brake_temp_critical",
-    "pit_window_open", "track_limits_warning",
-    "session_brief", "race_intro", "pre_race_check",
+# Fix 17/05 F10 : on inverse la logique. Avant : whitelist `_LATCHES_RESET_ON_SESSION_CHANGE` qui
+# devait être maintenue à jour à chaque nouveau hysteresis_check ajouté → invariant fragile.
+# Maintenant : blacklist `_LATCHES_NEVER_RESET` (les events transients dont l'exit_condition gère
+# le re-fire correctement). Tout le reste est reset par défaut en transition session.
+# Quand on ajoute un nouvel event, par défaut il sera reset proprement → invariant solide.
+_LATCHES_NEVER_RESET = {
+    # Transients : exit_condition gère déjà le re-fire (yellow tombe → re-fire si yellow revient).
+    "yellow_flag", "traffic_on_push_lap",
+    # Edge-triggered idempotent : géré par dedup_key (lap_num), pas de latch persistant.
+    "lap_completed", "personal_best",
+    # Position changes : event par delta, pas de latch.
+    "position_change",
 }
 
 _LATCHES_RESET_ON_PIT_EXIT = {
@@ -410,27 +410,70 @@ _LATCHES_RESET_ON_PIT_EXIT = {
     "brake_temp_high", "brake_temp_critical",
 }
 
+# Fix F2 : State flags `_announced` qu'on doit reset à chaque vraie nouvelle session
+# (changement de track/car/session_type côté SHM, pas juste session_id Bono).
+# Sans ça, un `session_briefed=True` du combo précédent fait skip le brief de la nouvelle course.
+_STATE_FLAGS_RESET_ON_SESSION_CHANGE = [
+    ("session_briefed", False),
+    ("out_lap_announced_lap", -1),
+    ("warmup_complete_announced", False),
+    ("chequered_announced", False),
+    ("race_intro_announced", False),
+    ("last_lap_announced", False),
+    ("pre_race_check_announced", False),
+    ("session_meta_filled", False),
+    ("last_lap_count", 0),
+    ("last_logged_lap", 0),
+    ("last_position", -1),
+    ("last_gap_behind_ms", 0),
+    ("last_damage_total", 0.0),
+    ("current_lap_sectors", None),   # spécial : reset à []
+    ("laps_remaining_announced", None),  # spécial : reset à set()
+]
+
+
+def _reset_state_for_new_session():
+    """Centralisé : reset les State flags one-shot d'une session.
+    Avant ce fix (audit 17/05) : flags éparpillés, certains restaient True du précédent run
+    → brief skip silencieux. Cf. post-mortem `feature added without invariant update`."""
+    for attr, default in _STATE_FLAGS_RESET_ON_SESSION_CHANGE:
+        if attr == "current_lap_sectors":
+            _state.current_lap_sectors = []
+        elif attr == "laps_remaining_announced":
+            _state.laps_remaining_announced = set()
+        else:
+            setattr(_state, attr, default)
+    logger.info("[state] reset session-scoped flags (one-shot announces, lap counters, position)")
+
 
 def reset_latches_on_session_transition(snap: dict):
-    """Detect (session_type, session_id) change + pit-exit transition → clear relevant latches.
-    Called at top of detect_auto_events on every tick. Cheap : just string compare + set ops.
+    """Detect transition (track/car/session_type/sid) → clear latches + reset State flags.
+    Called at top of detect_auto_events on every tick.
 
-    Anti-pattern fix (3 IAs consensus 17/05) : hysteresis latching is correct in-session, but
-    without reset on session transition, a fuel_warning fired in Practice would never refire
-    when the driver goes back to Race. Result : warnings silently muted across sessions.
+    Fix F10 17/05 : blacklist (NEVER_RESET) au lieu de whitelist → invariant solide quand
+    on ajoute de nouveaux events. Tout latch sauf transients est reset par défaut.
+
+    Fix F2 17/05 : reset aussi les State flags `_announced` (session_briefed, race_intro, etc.)
+    via _reset_state_for_new_session(). Sans ça, le brief de la nouvelle course est skippé
+    silencieusement car le flag du combo précédent reste True.
+
+    La signature inclut TRACK + CAR (pas juste session_id) car Bono garde le même session_id
+    pendant tout son uptime ; la vraie "nouvelle session" se voit via SHM track/car change.
     """
     session_type = (snap.get("session") or "").upper()
+    track = (snap.get("track") or "").lower()
+    car = (snap.get("car") or "").lower()
     sid = _state.session_id or 0
-    signature = f"{session_type}|{sid}"
+    signature = f"{track}|{car}|{session_type}|{sid}"
     if signature != _state.last_session_signature:
         if _state.last_session_signature is not None:
             cleared = 0
-            for ev in _LATCHES_RESET_ON_SESSION_CHANGE:
-                if ev in _event_latch:
+            for ev in list(_event_latch.keys()):
+                if ev not in _LATCHES_NEVER_RESET:
                     _event_latch.pop(ev, None)
                     cleared += 1
-            if cleared > 0:
-                logger.info(f"[latch] session transition {_state.last_session_signature} → {signature} : reset {cleared} latches")
+            logger.info(f"[latch] session transition {_state.last_session_signature} → {signature} : reset {cleared} latches")
+            _reset_state_for_new_session()
         _state.last_session_signature = signature
 
     # Pit-exit transition : driver was in pit, no longer is → reset stint latches
@@ -555,7 +598,14 @@ def fire_event(event_type: str, severity: str, message: str, payload: dict | Non
         except Exception: pass
     logger.info(f"[event] {severity.upper()} {event_type}: {message}")
     if _state.session_id:
-        memory.log_event(_state.session_id, event_type, severity, payload or {"msg": message})
+        event_id = memory.log_event(_state.session_id, event_type, severity, payload or {"msg": message})
+        # Fix F3 17/05 : corrélation event <-> état véhicule pour post-session debrief
+        try:
+            current_snap = _state.fake_snapshot if _state.fake_mode else _state.snapshot
+            if current_snap and current_snap.get("shm_ok"):
+                memory.log_system_snapshot(_state.session_id, event_id, current_snap)
+        except Exception as e:
+            logger.debug(f"[event] system_snapshot log fail : {e}")
     turn = new_turn_id()
     now = time.time()
     ok = send_play_text({"text": message, "mood": "calm", "auto_event": event_type, "turn_id": turn,
@@ -1247,6 +1297,22 @@ def handle_ptt(wav_bytes: bytes, meta: dict, deepgram_key: str, anthropic_client
     t_stt = (time.time() - t0) * 1000
     _state.metrics["avg_stt_ms"] = int(0.7 * _state.metrics["avg_stt_ms"] + 0.3 * t_stt)
     logger.info(f"[ptt] STT[{stt_provider}] '{transcript}' ({t_stt:.0f}ms)")
+    # Fix F3 17/05 : audio_metrics table was 0-row. Branchée maintenant après STT pour suivre
+    # qualité audio (RMS/peak/duration), corrélation avec quality du transcript et lang detected.
+    if _state.session_id:
+        try:
+            memory.log_audio_metric(
+                session_id=_state.session_id, turn_id=turn_id,
+                duration_s=float(meta.get("duration_s", 0) or 0),
+                rms=float(meta.get("rms", 0) or 0),
+                peak=float(meta.get("peak", 0) or 0),
+                sample_rate=int(meta.get("sample_rate", 16000) or 16000),
+                bytes_=len(wav_bytes),
+                transcript_len=len(transcript),
+                lang_detected=meta.get("lang_detected"),
+            )
+        except Exception as e:
+            logger.debug(f"[ptt] log_audio_metric fail : {e}")
     if not transcript or len(transcript) < 2:
         return
     # V2.3 latest-turn-wins (GPT-5.4 P1) : if a newer PTT arrived while we were STT'ing, abort here
@@ -2108,6 +2174,38 @@ def processes_status():
 # ============================================================
 # Main
 # ============================================================
+def play_status_listener(stop_event: threading.Event):
+    """Fix F7 17/05 : écoute les events play.status du playback_service via ZMQ SUB.
+    Quand un event state=done arrive avec tts_ms + playback_ms, met à jour la ligne
+    correspondante de pipeline_timings (avant : tts_ms=0, playback_ms=NULL hardcodés)."""
+    try:
+        from zmq_bus import make_sub, recv_json
+        sub = make_sub(ZMQ_EVENTS, topic="play.status")
+        logger.info(f"[play_status] subscribed to {ZMQ_EVENTS}")
+        while not stop_event.is_set():
+            msg = recv_json(sub, timeout_ms=1000)
+            if not msg:
+                continue
+            try:
+                topic, payload = msg
+                if not isinstance(payload, dict): continue
+                state = payload.get("state")
+                turn_id = payload.get("turn_id")
+                if state == "done" and turn_id is not None and _state.session_id:
+                    tts_ms = int(payload.get("tts_ms", 0) or 0)
+                    playback_ms = int(payload.get("playback_ms", 0) or 0)
+                    provider = payload.get("provider", "")
+                    if tts_ms or playback_ms:
+                        try:
+                            memory.update_pipeline_timing_tts(_state.session_id, turn_id, tts_ms, playback_ms, provider)
+                        except Exception as e:
+                            logger.debug(f"[play_status] pipeline update fail : {e}")
+            except Exception as e:
+                logger.debug(f"[play_status] handle fail : {e}")
+    except Exception as e:
+        logger.warning(f"[play_status] listener crashed : {e}")
+
+
 def main():
     logger.add("logs/core_service.log", rotation="10 MB", retention=3)
     logger.info("=== Bono v2 core_service start ===")
@@ -2122,7 +2220,8 @@ def main():
     stop = threading.Event()
     t_shm = threading.Thread(target=shm_loop, args=(stop,), daemon=True)
     t_audio = threading.Thread(target=audio_loop, args=(stop,), daemon=True)
-    t_shm.start(); t_audio.start()
+    t_playstatus = threading.Thread(target=play_status_listener, args=(stop,), daemon=True)
+    t_shm.start(); t_audio.start(); t_playstatus.start()
     try:
         uvicorn.run(app, host="127.0.0.1", port=HTTP_PORT, log_level="warning")
     except KeyboardInterrupt:
