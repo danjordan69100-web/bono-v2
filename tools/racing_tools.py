@@ -85,6 +85,50 @@ def _fmt_lap(ms) -> str:
     return f"{mins}:{secs:04.1f}"
 
 
+# Fix bug A/B brief V3 17/05 nuit : session-aware setup file selection.
+# Avant : query_setup_state et bono_engineer_setup_update_acc utilisaient `max(files, key=mtime)`
+# → si le dernier fichier modifié était _Wet.json, Bono croyait que Wet était actif en RACE sec.
+# Maintenant : match par suffixe dans le nom de fichier selon session_type + weather.
+SESSION_FILE_SUFFIXES = {
+    # session_type → liste de suffixes acceptables, par ordre de priorité
+    "RACE":     ["_Race", "_race"],
+    "QUALIFY":  ["_Qualif", "_Qualifying", "_Quali", "_qualif"],
+    "PRACTICE": ["_Practice", "_practice"],
+    "HOTLAP":   ["_Hotlap", "_hotlap"],
+    "HOTSTINT": ["_Hotstint", "_hotstint"],
+}
+# Suffixes wet (priorité sur session_type si pluie détectée)
+WET_SUFFIXES = ["_Wet", "_wet", "_Rain", "_rain"]
+
+
+def match_setup_file_for_session(setup_files: list[str], session_type: str = "", is_wet: bool = False) -> str | None:
+    """Returns the setup file path best matching the current session.
+    Priority : (1) wet match if is_wet, (2) session_type suffix, (3) fallback most-recent.
+    setup_files : list of full paths to .json (excl. .bak)."""
+    if not setup_files:
+        return None
+    # Use file basename for matching
+    import os as _o
+    if is_wet:
+        for suf in WET_SUFFIXES:
+            for f in setup_files:
+                bn = _o.path.basename(f)
+                if suf in bn and not bn.lower().endswith('.bak.json'):
+                    return f
+    session_upper = (session_type or "").upper()
+    for suf in SESSION_FILE_SUFFIXES.get(session_upper, []):
+        for f in setup_files:
+            bn = _o.path.basename(f)
+            if suf in bn:
+                return f
+    # Fallback : si un fichier match exactly "Setup" (generic), sinon mtime le plus récent
+    for f in setup_files:
+        bn = _o.path.basename(f).lower()
+        if "_setup" in bn and not any(suf.lower() in bn for suf in WET_SUFFIXES):
+            return f
+    return max(setup_files, key=_o.path.getmtime)
+
+
 # ============================================================
 # query_telemetry
 # ============================================================
@@ -464,13 +508,20 @@ def bono_engineer_setup_update_acc(field: str, delta: float = 0, absolute_value:
     if not _o.path.isdir(setup_dir):
         return {"ok": False, "error_code": "setup_dir_not_found", "retryable": False,
                 "human_message": f"Dossier setup introuvable : {setup_dir}", "path": setup_dir}
-    # Find most recently modified .json (= current setup) — exclude .backups subdir
+    # Find session-matching .json (= current setup correct) — Fix bug B 17/05 nuit.
     jsons = [_o.path.join(setup_dir, f) for f in _o.listdir(setup_dir) if f.endswith(".json") and not f.endswith(".bak.json")]
     if not jsons:
         return {"ok": False, "error_code": "no_json_setup_in_dir", "retryable": False,
                 "human_message": f"Aucun setup .json dans {setup_dir}", "path": setup_dir}
-    jsons.sort(key=_o.path.getmtime, reverse=True)
-    target = jsons[0]
+    # Session-aware match : avant ce fix, on prenait `jsons.sort(mtime)[0]` → modif sur le mauvais
+    # fichier (ex : _Wet.json modifié alors qu'on tournait en RACE). Désormais on cherche le suffixe
+    # qui matche le session_type + wet detection.
+    session_type = (snap.get("session") or "").upper()
+    is_wet = (snap.get("rain_intensity", 0) or 0) > 0.05
+    target = match_setup_file_for_session(jsons, session_type=session_type, is_wet=is_wet)
+    if not target:
+        jsons.sort(key=_o.path.getmtime, reverse=True)
+        target = jsons[0]  # ultime fallback
     # Backup
     backup_dir = _o.path.join(setup_dir, ".backups")
     _o.makedirs(backup_dir, exist_ok=True)
@@ -563,17 +614,37 @@ def bono_engineer_setup_update_acc(field: str, delta: float = 0, absolute_value:
 )
 def query_setup_state(fields: list | None = None) -> dict:
     import os as _o, json as _json, glob as _g
+    # Fix bug A 17/05 nuit : lire le BON fichier selon session_type + weather, pas mtime.
+    s = _snap()
+    car = (s.get("car") or "").strip()
+    track = (s.get("track") or "").strip()
+    session_type = (s.get("session") or "").upper()
+    is_wet = (s.get("rain_intensity", 0) or 0) > 0.05
     cm_dir = _o.path.expanduser(r"~\Documents\Assetto Corsa Competizione\Setups")
     if not _o.path.isdir(cm_dir):
         return _err("setup_dir_missing", "ACC Setups dir absent", retryable=False)
-    files = _g.glob(_o.path.join(cm_dir, "**", "*.json"), recursive=True)
+    # Si on connaît car+track, scope aux fichiers de ce dossier uniquement
+    if car and track:
+        scope_dir = _o.path.join(cm_dir, car, track)
+        if _o.path.isdir(scope_dir):
+            files = [_o.path.join(scope_dir, f) for f in _o.listdir(scope_dir)
+                     if f.endswith(".json") and not f.endswith(".bak.json")]
+        else:
+            files = _g.glob(_o.path.join(cm_dir, "**", "*.json"), recursive=True)
+            files = [f for f in files if not f.endswith(".bak.json")]
+    else:
+        files = _g.glob(_o.path.join(cm_dir, "**", "*.json"), recursive=True)
+        files = [f for f in files if not f.endswith(".bak.json")]
     if not files:
         return _err("no_setup_files", "Aucun setup ACC trouvé", retryable=False)
-    latest = max(files, key=_o.path.getmtime)
+    # Session-aware match
+    latest = match_setup_file_for_session(files, session_type=session_type, is_wet=is_wet)
+    if not latest:
+        latest = max(files, key=_o.path.getmtime)  # ultime fallback
     try:
         with open(latest, "r", encoding="utf-8") as f:
             data = _json.load(f)
-        result = {"setup_file": _o.path.basename(latest)}
+        result = {"setup_file": _o.path.basename(latest), "session_type_matched": session_type or "?", "wet_mode": is_wet}
         key_paths = {
             "fuel": ["basicSetup", "strategy", "fuel"],
             "tyrePressure": ["basicSetup", "tyres", "tyrePressure"],
@@ -618,42 +689,48 @@ def query_setup_state(fields: list | None = None) -> dict:
     }, "required": []}
 )
 def grid_engineer_audit(laps_to_finish: int = 0) -> dict:
-    """Compare current setup vs KB. Suggests deltas with reasoning."""
+    """Compare current setup vs KB. Suggests deltas with reasoning.
+    Fix bug C 17/05 nuit : session_type + weather adaptation des targets (sec vs wet,
+    practice vs quali vs race)."""
     from tools.acc_knowledge import (
         get_car_knowledge, get_track_knowledge, get_combo_hint,
         click_to_psi_hot, psi_hot_target_to_click,
+        get_session_tyre_target_psi, get_session_bb_target_pct,
     )
     s = _snap()
     car = (s.get("car") or "").strip()
     track = (s.get("track") or "").strip()
+    session_type = (s.get("session") or "").upper()
+    is_wet = (s.get("rain_intensity", 0) or 0) > 0.05
     if not car or not track:
         return _err("no_car_or_track", "Pas de car/track dans SHM, ACC pas lancé?", retryable=True)
     car_kb = get_car_knowledge(car) or {}
     track_kb = get_track_knowledge(track) or {}
     combo_hint = get_combo_hint(car, track) or {}
-    # Read current setup
+    # Read current setup (session-aware file selection)
     state = query_setup_state()
     if not state.get("ok"):
         return state
     audit = []  # list of {field, current, target, delta, severity, reason}
-    # 1. Brake bias
+    # 1. Brake bias session-aware
     bb_cur = state.get("brakeBias")
     bb_range = car_kb.get("bb_range_pct")
     if bb_cur is not None and bb_range:
-        # ACC brakeBias stocké = (BB_pct - 50) * 10 (scale int)
         bb_pct_cur = round(50 + bb_cur / 10.0, 1)
-        bb_target = (combo_hint.get("bb_target_pct") if combo_hint else None) or (bb_range[0] + bb_range[1]) / 2
+        bb_target = get_session_bb_target_pct(car_kb, combo_hint, session_type, is_wet)
+        if bb_target is None:
+            bb_target = (bb_range[0] + bb_range[1]) / 2
         if not (bb_range[0] <= bb_pct_cur <= bb_range[1]):
             audit.append({"field": "brakeBias", "current_pct": bb_pct_cur, "target_pct": bb_target,
                           "allowed_range": bb_range, "severity": "high",
-                          "reason": f"BB {bb_pct_cur}% hors range {car} ({bb_range[0]}-{bb_range[1]}%)"})
+                          "reason": f"BB {bb_pct_cur}% hors range {car} ({bb_range[0]}-{bb_range[1]}%) — session {session_type}{' WET' if is_wet else ''}"})
         elif abs(bb_pct_cur - bb_target) > 1.0:
             audit.append({"field": "brakeBias", "current_pct": bb_pct_cur, "target_pct": bb_target,
                           "severity": "medium",
-                          "reason": f"BB {bb_pct_cur}% éloigné target combo {bb_target}%"})
-    # 2. Tyre pressure (per wheel)
+                          "reason": f"BB {bb_pct_cur}% éloigné target {session_type}{' WET' if is_wet else ''} ({bb_target}%)"})
+    # 2. Tyre pressure (per wheel) — session + weather adapté
     tp_cur = state.get("tyrePressure") or []
-    tp_targets = car_kb.get("tyre_pressure_target_hot_psi") or {}
+    tp_targets = get_session_tyre_target_psi(car_kb, session_type, is_wet)
     if isinstance(tp_cur, list) and len(tp_cur) == 4 and tp_targets:
         labels = ("FL", "FR", "RL", "RR")
         for i, lbl in enumerate(labels):
@@ -700,15 +777,16 @@ def grid_engineer_audit(laps_to_finish: int = 0) -> dict:
         severity_counts[a.get("severity", "medium")] += 1
     return _ok({
         "track": track, "car": car,
+        "session_type": session_type, "wet_mode": is_wet,
         "setup_file": state.get("setup_file"),
         "n_issues": len(audit),
         "severity_breakdown": severity_counts,
         "audit": audit,
         "overall_verdict": (
-            "Setup OK, peu/pas d'ajustements." if not audit
-            else f"{severity_counts['high']} ajustements critiques, {severity_counts['medium']} mineurs recommandés."
+            f"Setup {session_type}{' WET' if is_wet else ''} OK, peu/pas d'ajustements." if not audit
+            else f"{severity_counts['high']} ajustements critiques, {severity_counts['medium']} mineurs recommandés (session {session_type}{' WET' if is_wet else ''})."
         ),
-        "note_psi_caveat": "PSI hot estimations utilisent COLD_TO_HOT_DELTA=2.0 PSI (approximation moyenne). Variations possibles selon track temp.",
+        "note_psi_caveat": "PSI hot estimations utilisent COLD_TO_HOT_DELTA=2.0 PSI. Targets adaptés session_type + wet/dry.",
     })
 
 

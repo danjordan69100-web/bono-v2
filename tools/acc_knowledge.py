@@ -7,6 +7,72 @@ CRITICAL : tout conseil setup/driving voiture-specifique DOIT consulter ces donn
 au lieu de génériquer. Sinon Bono = "ChatGPT racing", pas vrai ingé.
 """
 
+# Fix bug C/D 17/05 nuit : targets différenciés par session_type + weather.
+# Avant : tyre_pressure_target_hot_psi uniforme → grid_engineer_audit appliquait les mêmes
+# objectifs en Race/Quali/Wet, ce qui est faux (wet target ~24-25 PSI vs sec 26.6-27).
+#
+# Logique session-aware (Pirelli DHF consensus communauté ACC) :
+#   - PRACTICE / RACE : 26.6-27.0 hot (target nominal Pirelli DHF sec)
+#   - QUALIFY : 26.3-26.8 hot (cold départ + 1 push lap → atteint 26.7 peak en fin tour)
+#   - HOTLAP / HOTSTINT : 26.5-26.9 hot (cold start similaire à quali, mais 2-3 laps)
+#   - WET : 24.0-25.5 hot (sous-gonflé volontairement pour empreinte plus large + résist aquaplaning)
+#
+# Brake bias session-aware :
+#   - RACE : milieu de range (gestion freinage stable)
+#   - QUALIFY : +1% vers avant (peak grip, freinage tardif)
+#   - WET : -1 à -2% (transfer freinage arrière pour stabilité)
+SESSION_PRESSURE_OFFSET_PSI = {
+    # delta vs target_hot_psi sec nominal
+    "PRACTICE": 0.0,
+    "RACE":     0.0,
+    "QUALIFY": -0.3,
+    "HOTLAP":  -0.2,
+    "HOTSTINT": -0.1,
+}
+WET_PRESSURE_OFFSET_PSI = -2.3  # wet ACC : ~24.5 hot vs 26.8 sec
+
+SESSION_BB_OFFSET_PCT = {
+    "PRACTICE": 0.0,
+    "RACE":     0.0,
+    "QUALIFY": +1.0,
+    "HOTLAP":  +0.5,
+    "HOTSTINT": 0.0,
+}
+WET_BB_OFFSET_PCT = -1.5  # transfer arrière pour stabilité braking sous pluie
+
+
+def get_session_tyre_target_psi(car_kb: dict, session_type: str = "", is_wet: bool = False) -> dict:
+    """Returns target PSI hot per wheel adapted to session + weather.
+    Falls back to nominal car_kb if no adjustment found."""
+    if not car_kb:
+        return {}
+    nominal = car_kb.get("tyre_pressure_target_hot_psi") or {}
+    if not nominal:
+        return {}
+    if is_wet:
+        offset = WET_PRESSURE_OFFSET_PSI
+    else:
+        offset = SESSION_PRESSURE_OFFSET_PSI.get((session_type or "").upper(), 0.0)
+    return {k: round(v + offset, 2) for k, v in nominal.items()}
+
+
+def get_session_bb_target_pct(car_kb: dict, combo_hint: dict | None = None, session_type: str = "", is_wet: bool = False) -> float | None:
+    """Returns target BB% adapted to session + weather."""
+    if not car_kb:
+        return None
+    bb_range = car_kb.get("bb_range_pct")
+    if not bb_range:
+        return None
+    base = (combo_hint or {}).get("bb_target_pct")
+    if base is None:
+        base = (bb_range[0] + bb_range[1]) / 2.0
+    if is_wet:
+        offset = WET_BB_OFFSET_PCT
+    else:
+        offset = SESSION_BB_OFFSET_PCT.get((session_type or "").upper(), 0.0)
+    return round(base + offset, 1)
+
+
 # Phase C prereq brief V3 17/05 : PSI mapping formula ACC.
 # Source : community ACC consensus (forum AC, Reddit r/ACCompetizione, Kunos manual).
 # IMPORTANT : conversion VÉRIFIÉE valide pour ACC 1.9+ Pirelli DHF mais ASSUMPTION sur cold→hot.
