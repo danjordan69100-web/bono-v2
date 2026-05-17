@@ -1218,8 +1218,13 @@ def handle_ptt(wav_bytes: bytes, meta: dict, deepgram_key: str, anthropic_client
         dg = _get_dg_client(deepgram_key)
         if dg is None:
             raise RuntimeError("no DeepgramClient available")
-        kwargs = dict(request=wav_bytes, model=DEEPGRAM_MODEL, language=DEEPGRAM_LANGUAGE, smart_format=True, punctuate=True)
-        resp = dg.listen.v1.media.transcribe_file(**kwargs)
+        # Fix 17/05 : SDK v3.11 utilise `listen.rest.v("1").transcribe_file(source, options)`, pas `listen.v1.media.*` (API v4+).
+        # Le code original déclenchait `'ListenRouter' object has no attribute 'v1'` à chaque PTT
+        # → 100% fallback Whisper (5-6s STT au lieu de <1s Deepgram).
+        from deepgram import PrerecordedOptions
+        source = {"buffer": wav_bytes}
+        options = PrerecordedOptions(model=DEEPGRAM_MODEL, language=DEEPGRAM_LANGUAGE, smart_format=True, punctuate=True)
+        resp = dg.listen.rest.v("1").transcribe_file(source, options)
         transcript = (resp.results.channels[0].alternatives[0].transcript or "").strip()
         stt_provider = "deepgram"
     except Exception as e:
