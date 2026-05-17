@@ -488,6 +488,73 @@ SETUP_FIELD_MAP = {
 
 
 @bono_tool(
+    name="bono_engineer_setup_update_acc_batch",
+    description="""BATCH version of bono_engineer_setup_update_acc — modifie PLUSIEURS champs en UN SEUL call.
+A PRIVILEGIER quand le driver demande N modifs setup d'un coup (ex: 4 PSI pneus, BB + ARB, etc.).
+
+USE FOR:
+- 'Augmente tous les PSI de 2 clicks' (4 fields)
+- 'BB à 54 et ARB front mou' (2 fields)
+- Toute série de modifs setup simultanées
+
+DON'T USE FOR:
+- 1 seul champ → use bono_engineer_setup_update_acc direct
+
+Plus efficient : 1 tool call vs 4 tool calls. Reduit la latence + tokens consommés.
+Chaque modif est range-checked indépendamment. Result inclut un report par field.""",
+    parameters={"type": "object", "properties": {
+        "modifications": {
+            "type": "array",
+            "description": "Liste de modifs. Chaque entree : {field, delta?, absolute_value?}",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "delta": {"type": "integer"},
+                    "absolute_value": {"type": "integer"},
+                },
+                "required": ["field"]
+            }
+        }
+    }, "required": ["modifications"]}
+)
+def bono_engineer_setup_update_acc_batch(modifications: list) -> dict:
+    """Batch tool : applique N modifs setup en 1 call. Returns reports per field."""
+    if not modifications or not isinstance(modifications, list):
+        return _err("invalid_modifications", "Pass list of {field, delta/absolute_value}", retryable=False)
+    results = []
+    n_ok = 0
+    n_fail = 0
+    n_noop = 0
+    for mod in modifications:
+        if not isinstance(mod, dict) or "field" not in mod:
+            results.append({"ok": False, "error": "missing field key", "mod": mod})
+            n_fail += 1
+            continue
+        field = mod["field"]
+        delta = mod.get("delta", 0)
+        abs_val = mod.get("absolute_value")
+        r = bono_engineer_setup_update_acc(field=field, delta=delta, absolute_value=abs_val)
+        # Detect no-op (old == new)
+        if r.get("ok") and r.get("old") == r.get("new"):
+            r["noop"] = True
+            n_noop += 1
+        elif r.get("ok"):
+            n_ok += 1
+        else:
+            n_fail += 1
+        results.append(r)
+    return _ok({
+        "n_modifications": len(modifications),
+        "n_applied": n_ok,
+        "n_noop": n_noop,
+        "n_failed": n_fail,
+        "results": results,
+        "summary": f"{n_ok} applied, {n_noop} no-op (already at value), {n_fail} failed",
+    })
+
+
+@bono_tool(
     name="bono_plan_race_fuel_pits",
     description="""ALL-IN-ONE pre-race fuel + pit strategy planner. Calcule fuel optimal + nb pit stops + applique au setup ACC.
 

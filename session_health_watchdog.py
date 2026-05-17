@@ -137,11 +137,15 @@ def audit_session(session_start_ts: float, session_end_ts: float) -> dict:
             ("pipeline_timings", "Pipeline timings (STT/LLM/TTS)"),
         ]:
             try:
-                n = c.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE ts > ?" if table in ("audio_metrics","system_snapshot_at_event","lap_history","driving_trace","events","pipeline_timings")
-                    else f"SELECT COUNT(*) FROM {table} WHERE created_at > ?",
-                    (session_start_ts if table != "setup_changes" else datetime.fromtimestamp(session_start_ts).isoformat(),)
-                ).fetchone()[0]
+                # Fix 17/05 : setup_changes.created_at stocké en ISO UTC ("Z" suffix).
+                # Avant : on comparait à datetime.fromtimestamp(ts).isoformat() en LOCAL → ISO mismatch (UTC vs local).
+                # Maintenant : on convertit session_start_ts en UTC ISO pour matcher.
+                from datetime import timezone as _tz
+                if table in ("audio_metrics","system_snapshot_at_event","lap_history","driving_trace","events","pipeline_timings"):
+                    n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE ts > ?", (session_start_ts,)).fetchone()[0]
+                else:
+                    iso_utc = datetime.fromtimestamp(session_start_ts, tz=_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE created_at > ?", (iso_utc,)).fetchone()[0]
                 info[f"db_{table}_new_rows"] = n
                 if table in ("audio_metrics", "system_snapshot_at_event") and n == 0:
                     issues.append(f"{friendly}: 0 row added during session. Instrumentation cassée ?")
