@@ -1,0 +1,49 @@
+# Secrets (NEVER COMMIT)
+.env
+.env.*
+*.key
+*.token
+*.pem
+secrets/
+
+# Generated runtime data
+logs/
+db/
+shm/data/
+tts_cache/
+*.mp3
+*.wav
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Backups (regenerable, large)
+backups_*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Sessions / profiling output
+bono_sessions/
+*.csv
+*_presentmon.csv
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Virtual envs
+venv/
+.venv/
+env/
