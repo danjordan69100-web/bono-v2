@@ -973,12 +973,14 @@ def detect_auto_events(snap: dict):
         r10 = snap.get("rain_intensity_in_10min", 0)
         r30 = snap.get("rain_intensity_in_30min", 0)
         r_now = snap.get("rain_intensity", 0)
-        # Edge-trigger : si r10 augmente vs last known
-        if r10 > _state.last_known_rain_in_10 and r10 > 0 and r_now == 0:
+        # Edge-trigger : si r10 augmente vs last known + cooldown 5min anti-spam
+        # Fix anti-spam 17/05 nuit : sans cooldown, le forecast ACC fluctue toutes les 30-60s
+        # et chaque hausse refire l'event. Maintenant : can_fire avec cooldown 300s.
+        if r10 > _state.last_known_rain_in_10 and r10 > 0 and r_now == 0 and can_fire("rain_incoming_10min", 300):
             fire_event("rain_incoming_10min", "warn",
                        f"Pluie attendue dans 10 minutes, intensité {r10}. Prépare-toi.",
                        {"intensity_10min": r10, "intensity_30min": r30, "session": session_type}, ttl_s=20)
-        elif r30 > _state.last_known_rain_in_30 and r30 > 0 and r10 == 0:
+        elif r30 > _state.last_known_rain_in_30 and r30 > 0 and r10 == 0 and can_fire("rain_incoming_30min", 600):
             fire_event("rain_incoming_30min", "info",
                        f"Pluie possible dans 30 minutes, intensité {r30}. Monitore.",
                        {"intensity_10min": r10, "intensity_30min": r30, "session": session_type}, ttl_s=20)
@@ -1175,7 +1177,9 @@ def detect_auto_events(snap: dict):
                 gap_delta = gap_behind - _state.last_gap_behind_ms
                 # closing fast = >0.3s de réduction sur intervalle court
                 if gap_delta < -300:  # voiture derrière s'est rapprochée de 0.3s+
-                    if can_fire("closing_rate", 15):
+                    # Fix anti-spam 17/05 nuit : cooldown 15s -> 60s. 15s = répète à chaque ticks
+                    # SHM consécutifs si pression continue de la voiture derrière.
+                    if can_fire("closing_rate", 60):
                         fire_event("closing_rate", "warn",
                                    f"Voiture derrière se rapproche, défends.",
                                    {"gap_behind_ms": gap_behind, "delta_ms": gap_delta, "session": session_type}, ttl_s=10)
