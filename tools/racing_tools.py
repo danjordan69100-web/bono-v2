@@ -473,15 +473,92 @@ SETUP_FIELD_MAP = {
     "abs":                (["basicSetup", "electronics", "abs"], 1, [0, 11]),
     "ecu_map":            (["basicSetup", "electronics", "ecuMap"], 1, [0, 11]),
     "fuel_mix":           (["basicSetup", "electronics", "fuelMix"], 1, [0, 5]),
-    # === STRATEGY ===
+    # === STRATEGY === (fix 17/05 nuit : ajout tyre_set + brake pad compound — full pre-race strategy editable)
     "fuel":               (["basicSetup", "strategy", "fuel"], 1, [0, 120]),
     "n_pit_stops":        (["basicSetup", "strategy", "nPitStops"], 1, [0, 4]),
+    "tyre_set":           (["basicSetup", "strategy", "tyreSet"], 1, [0, 49]),
+    "front_brake_pad":    (["basicSetup", "strategy", "frontBrakePadCompound"], 1, [0, 3]),
+    "rear_brake_pad":     (["basicSetup", "strategy", "rearBrakePadCompound"], 1, [0, 3]),
     # === BRAKES ===
     "brake_duct_front":   (["advancedSetup", "mechanicalBalance", "brakeDuct", 0], 1, [0, 6]),
     "brake_duct_rear":    (["advancedSetup", "mechanicalBalance", "brakeDuct", 1], 1, [0, 6]),
     "brake_pads_front":   (["basicSetup", "brakeSystem", "brakePadCompoundFront"], 1, [0, 3]),
     "brake_pads_rear":    (["basicSetup", "brakeSystem", "brakePadCompoundRear"], 1, [0, 3]),
 }
+
+
+@bono_tool(
+    name="bono_plan_race_fuel_pits",
+    description="""ALL-IN-ONE pre-race fuel + pit strategy planner. Calcule fuel optimal + nb pit stops + applique au setup ACC.
+
+USE FOR:
+- Driver demande "Bono prépare la stratégie pour cette course de 30/60/120 min"
+- Avant un départ race : auto-calc fuel à charger + nb pit stops + applique au setup file
+- Endurance : compute multi-stint avec marges adaptées
+
+DON'T USE FOR:
+- Pit stop ACTION en course (fuel à ajouter / tyre change) → ça se fait via MFD ingame (Bono ne peut pas pousser touches MFD)
+- Just check fuel needed → use query_fuel_for_session_plan (read-only)
+
+Output : detailed plan + applies fuel/n_pit_stops to current Race setup file.""",
+    parameters={"type": "object", "properties": {
+        "duration_min": {"type": "number", "description": "Race duration in minutes"},
+        "max_pit_stops": {"type": "integer", "description": "Max pit stops planifies (default 1 pour sprint, 2-3 endurance)"},
+        "safety_margin_pct": {"type": "number", "description": "Extra fuel safety margin % (default 10)"},
+        "apply": {"type": "boolean", "description": "Apply au setup ACC (default true). False = dry-run report only."},
+    }, "required": ["duration_min"]}
+)
+def bono_plan_race_fuel_pits(duration_min: float, max_pit_stops: int = 1, safety_margin_pct: float = 10, apply: bool = True) -> dict:
+    """Fix 17/05 nuit : tool integre pour planifier la strategie complete race avant le start."""
+    import math
+    s = _snap()
+    if not s.get("shm_ok"):
+        return _err("shm_unavailable", "ACC pas en LIVE", retryable=True)
+    car = (s.get("car") or "").strip()
+    track = (s.get("track") or "").strip()
+    fuel_per_lap = s.get("fuel_per_lap", 0) or 0
+    if fuel_per_lap < 0.5:
+        # Fallback track default
+        fuel_per_lap = _get_avg_fuel_per_lap(track)
+    # Track lap time estimate
+    try:
+        from tools.acc_knowledge import get_track_knowledge
+        track_kb = get_track_knowledge(track) or {}
+        avg_lap_s = track_kb.get("avg_lap_time_s") or track_kb.get("typical_lap_s") or 100
+    except Exception:
+        avg_lap_s = 100
+    # Total laps
+    total_laps = math.ceil((duration_min * 60) / avg_lap_s) + 1  # +1 for safety/in-lap
+    total_fuel_needed = total_laps * fuel_per_lap * (1 + safety_margin_pct / 100)
+    # Tank capacity GT3 ~120L
+    tank_max = 120
+    # Calcul stops
+    n_stops = max(0, min(max_pit_stops, math.ceil(total_fuel_needed / tank_max) - 1))
+    fuel_start = math.ceil(min(total_fuel_needed / (n_stops + 1), tank_max))
+    plan = {
+        "track": track, "car": car,
+        "duration_min": duration_min,
+        "estimated_total_laps": total_laps,
+        "fuel_per_lap_l": round(fuel_per_lap, 2),
+        "avg_lap_s": avg_lap_s,
+        "total_fuel_needed_l": math.ceil(total_fuel_needed),
+        "n_pit_stops_recommended": n_stops,
+        "fuel_at_start_l": fuel_start,
+        "tank_max_l": tank_max,
+        "stints_estimated_laps": [math.ceil(total_laps / (n_stops + 1))] * (n_stops + 1) if n_stops >= 0 else [total_laps],
+        "applied": False,
+    }
+    if apply:
+        # Apply via bono_engineer_setup_update_acc
+        try:
+            r_fuel = bono_engineer_setup_update_acc(field="fuel", absolute_value=fuel_start)
+            r_pits = bono_engineer_setup_update_acc(field="n_pit_stops", absolute_value=n_stops)
+            plan["fuel_apply_result"] = r_fuel
+            plan["pits_apply_result"] = r_pits
+            plan["applied"] = bool(r_fuel.get("ok") and r_pits.get("ok"))
+        except Exception as e:
+            plan["apply_error"] = str(e)
+    return _ok(plan)
 
 
 @bono_tool(

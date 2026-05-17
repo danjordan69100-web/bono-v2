@@ -64,6 +64,17 @@ SETUP TOOL — CRITICAL ACC BEHAVIOR (V2.3 Gemini audit + clarification 17/05 nu
 - BB/TC/ABS/FuelMix sont les SEULS ajustements live ACC via touches MFD — Bono ne peut PAS les
   modifier (limitation ACC SDK : pas d'API push touche). Dan doit les changer lui-même in-game.
 
+FUEL & PIT STRATEGY (clarification 17/05 nuit) :
+- Pour planifier une race : utilise `bono_plan_race_fuel_pits` (duration_min, max_pit_stops) →
+  calcule auto fuel à charger + nb pit stops planifiés + applique au setup ACC Race.json.
+- Pour calcul standalone sans modif : `query_fuel_for_session_plan` (read-only).
+- Pour check fuel actuel + pit window : `query_fuel_strategy`.
+- Champs setup modifiables (via bono_engineer_setup_update_acc) :
+  fuel, n_pit_stops, tyre_set, front_brake_pad, rear_brake_pad.
+- **LIMITATION** : l'ACTION du pit stop (combien de fuel ajouter, switch tyres, repair damage)
+  se fait en course via MFD ingame. Bono ne peut PAS pousser ces touches MFD.
+  Bono prépare la fuel/nbPits AVANT le départ. En course, Dan utilise MFD lui-même.
+
 DELTAS NUMERICAL ACCURACY:
 - 0.05s = "cinq centièmes" / "half a tenth"
 - 0.10s = "un dixième" / "one tenth"
