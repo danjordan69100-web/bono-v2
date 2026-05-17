@@ -92,6 +92,34 @@ ACC_PSI_PER_CLICK = 0.1
 ACC_COLD_TO_HOT_DELTA_DEFAULT = 2.0
 
 
+# Fix 0.4 brief V3 17/05 nuit : wheelbase par voiture (mètres).
+# Utilisé par detect_auto_events understeer/oversteer detection :
+#   expected_yaw = (v_ms) * tan(steer) / wheelbase
+# Source : Kunos vehicle data ACC + technical specs constructeurs.
+# Avant : hardcoded 2.85m (BMW M4) pour toutes les voitures → erreur ±15% sur Porsche/Lambo.
+WHEELBASES_M = {
+    "ferrari_488_gt3_evo":         2.65,
+    "bmw_m4_gt3":                  2.85,
+    "porsche_992_gt3_r":           2.46,
+    "porsche_991_ii_gt3_r":        2.46,
+    "mclaren_720s_gt3_evo":        2.67,
+    "audi_r8_lms_evo_ii":          2.65,
+    "mercedes_amg_gt3_evo":        2.66,
+    "lamborghini_huracan_gt3_evo": 2.62,
+    "lamborghini_huracan_gt3_evo2":2.62,
+    "aston_martin_vantage_gt3_amr":2.70,
+    "honda_nsx_gt3_evo":           2.61,
+    "lexus_rc_f_gt3":              2.73,
+    "nissan_gtr_nismo_gt3":        2.78,
+    "bentley_continental_gt3":     2.85,
+}
+WHEELBASE_DEFAULT_M = 2.70  # moyenne GT3 si car_id inconnu
+
+
+def get_wheelbase_m(car_id: str) -> float:
+    return WHEELBASES_M.get((car_id or "").lower(), WHEELBASE_DEFAULT_M)
+
+
 def click_to_psi_cold(click_value: int) -> float:
     """Click ACC setup → PSI cold (à la sortie des stands, pneus froids)."""
     return round(ACC_PSI_BASE_COLD + click_value * ACC_PSI_PER_CLICK, 2)

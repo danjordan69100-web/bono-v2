@@ -587,21 +587,33 @@ def format_lap_time_fr(ms: int) -> str:
 
 def fire_event(event_type: str, severity: str, message: str, payload: dict | None = None, ttl_s: float = 8.0):
     """Fire event to playback queue with TTL (drop if stale at play time).
-    V5 "do not speak zones" : si driver en freinage hard (brake>0.7 + speed>200) ET event=info,
-    on ajoute du TTL pour que ça parle APRÈS le freinage (priority queue le drainera après).
-    Les events warn/critical passent quand même immédiatement."""
+    Fix 0.1 brief V3 17/05 nuit : silence_zones DROP au lieu d'EXTEND TTL.
+    Avant : event info hard-braking → TTL étendu à 10s → joué APRÈS le freinage, mais
+    obsolète (info "pace_drift" pendant attaque T1 = no value 5s après).
+    Maintenant : event info en zone critique = DROP silencieux. Events warn/critical
+    passent toujours (yellow_flag, fuel_critical, brake_temp_critical, tyre_cliff)."""
     _state.metrics["events_fired"] += 1
-    # "Do not speak zones" — durant freinage T1 ou push lap, retarder events info uniquement
     snap = _state.snapshot if not _state.fake_mode else (_state.fake_snapshot or {})
     if snap and severity == "info":
         try:
             brake = snap.get("brake", 0) or 0
             speed = snap.get("speed_kmh", 0) or 0
-            if brake > 0.7 and speed > 200:
-                # Augmente TTL pour que l'event survive jusqu'à fin freinage (~3-5s)
-                ttl_s = max(ttl_s, 10.0)
-                logger.info(f"[event] DO-NOT-SPEAK zone (brake={brake:.2f} speed={speed:.0f}) → extend TTL {ttl_s}s for {event_type}")
-        except Exception: pass
+            steer = abs(snap.get("steer_angle_rad", 0) or 0)
+            rpm = snap.get("rpm", 0) or 0
+            # 1. Hard braking entry (corner approach)
+            if brake > 0.6 and speed > 150:
+                logger.info(f"[event] silence_drop type={event_type} reason=hard_braking_entry brake={brake:.2f} speed={speed:.0f}")
+                return
+            # 2. Mid-corner (low speed + significant steering)
+            if 60 < speed < 130 and steer > 0.3:
+                logger.info(f"[event] silence_drop type={event_type} reason=mid_corner speed={speed:.0f} steer={steer:.2f}")
+                return
+            # 3. High RPM push-lap straight (concentration max)
+            if rpm > 7800 and speed > 220:
+                logger.info(f"[event] silence_drop type={event_type} reason=high_rpm_straight rpm={rpm} speed={speed:.0f}")
+                return
+        except Exception as e:
+            logger.debug(f"[event] silence_zone check err: {e}")
     logger.info(f"[event] {severity.upper()} {event_type}: {message}")
     if _state.session_id:
         event_id = memory.log_event(_state.session_id, event_type, severity, payload or {"msg": message})
@@ -918,9 +930,16 @@ def detect_auto_events(snap: dict):
         now = time.time()
         # V5 audit : U/O detect en PRACTICE/HOTLAP only (race = trop bavard, quali = ne sert pas)
         if v > 80 and abs(steer) > 0.15 and (now - _state.last_uo_event_ts) > 30 and (is_practice or is_hotlap):
-            # wheelbase BMW M4 ~ 2.85m; expected_yaw = (v/3.6) * tan(steer) / wheelbase
+            # wheelbase dynamique selon car_kb (Fix 0.4 brief V3 17/05 nuit)
+            # Avant : hardcoded 2.85m (BMW M4). Porsche 992 = 2.46m, Mercedes AMG = 2.66m.
+            # Erreur ±15% sur expected_yaw selon la voiture → understeer/oversteer mal calibré.
+            try:
+                from tools.acc_knowledge import get_wheelbase_m
+                _wheelbase = get_wheelbase_m(snap.get("car", ""))
+            except Exception:
+                _wheelbase = 2.7
             import math
-            expected_yaw = (v / 3.6) * math.tan(steer) / 2.85
+            expected_yaw = (v / 3.6) * math.tan(steer) / _wheelbase
             if abs(expected_yaw) > 0.05:
                 ratio = yaw / expected_yaw if expected_yaw != 0 else 1.0
                 if ratio < 0.4 and ratio > -0.5:  # understeer
@@ -960,7 +979,26 @@ def detect_auto_events(snap: dict):
     # Simple proxy : utilise fuel_per_lap + fuel_l vs laps_remaining (si dispo via SHM)
     try:
         if is_race and snap.get("fuel_estimated_laps", 0) > 0:
-            laps_left_race = snap.get("session_time_left_ms", 0) / 1000 / 90  # approx 1:30 avg lap
+            # Fix 0.5 brief V3 17/05 nuit : avg_lap dynamique.
+            # Avant : hardcoded 90s → erreur sur Monza 108s (-17%) ou Spa 130s (-31%).
+            # Priorité : (1) moyenne 3 derniers laps valides session, (2) track_kb avg_lap_time_s,
+            #            (3) fallback 90s.
+            _avg_lap_s = 90.0
+            try:
+                if _state.session_id:
+                    _recent = memory.get_recent_laps(_state.session_id, n=3)
+                    _valid = [l for l in _recent if l.get("valid_lap") and l.get("lap_time_ms", 0) > 0]
+                    if _valid:
+                        _avg_lap_s = sum(l["lap_time_ms"] for l in _valid) / len(_valid) / 1000
+                if _avg_lap_s == 90.0:
+                    from tools.acc_knowledge import get_track_knowledge
+                    _track_kb = get_track_knowledge(snap.get("track", "")) or {}
+                    _kb_lap = _track_kb.get("avg_lap_time_s") or _track_kb.get("typical_lap_s")
+                    if _kb_lap and _kb_lap > 30:
+                        _avg_lap_s = float(_kb_lap)
+            except Exception:
+                _avg_lap_s = 90.0
+            laps_left_race = (snap.get("session_time_left_ms", 0) or 0) / 1000 / max(_avg_lap_s, 30)
             fuel_laps_est = snap.get("fuel_estimated_laps", 0)
             now = time.time()
             if laps_left_race > 2 and fuel_laps_est > 0 and fuel_laps_est < laps_left_race - 0.5:
@@ -1399,6 +1437,11 @@ def handle_ptt(wav_bytes: bytes, meta: dict, deepgram_key: str, anthropic_client
     # Bug 3 fix complet : propager STT timing/provider pour log_pipeline_timing
     snap["_t_stt_ms"] = int(t_stt)
     snap["_stt_provider"] = stt_provider
+    # Fix P0.1 brief V3 17/05 nuit : injecter session_id dans le snap pour que tools
+    # (gap_trend_engine, strategy_projection, query_sector_performance, query_driver_memory)
+    # puissent retrouver l'historique session courante sans repasser par _state global.
+    snap["_session_id"] = _state.session_id
+    snap["_session_signature"] = _state.last_session_signature
     token = set_turn_snapshot(snap)
     try:
         _handle_ptt_llm(transcript, turn_id, t0, push_play, anthropic_client, snap, tools_used=[])
@@ -1494,6 +1537,9 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
             # Phase A1 brief V3 : mutex global LLM. Sérialise vs futur strategist proactif.
             # Notes : on tient le lock pendant tout le streaming (cohérent — 1 conversation à la fois).
             # Si strategist veut parler en parallèle, il attendra ici (acceptable : strategist = async).
+            # Fix 0.2 17/05 nuit : flag SQL cross-process pour que strategist (autre process) skip.
+            try: memory.set_llm_busy(True)
+            except Exception: pass
             with _llm_global_lock, anthropic_client.messages.stream(
                 model=model_id, max_tokens=LLM_MAX_TOKENS, temperature=temperature,
                 system=system_blocks, tools=cached_tools, messages=messages,
@@ -1595,6 +1641,10 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
         logger.error(f"[ptt] LLM fail : {e}")
         _state.metrics["errors"] += 1
         return
+    finally:
+        # Fix 0.2 17/05 nuit : libère le flag SQL cross-process meme si exception/return early
+        try: memory.set_llm_busy(False)
+        except Exception: pass
     total_ms = int((time.time() - t0) * 1000)
     # Cost tracking (consensus 3 IA — was missing)
     cost = compute_cost_usd(model_id, tokens_in_total, tokens_out_total)
@@ -1780,6 +1830,33 @@ def build_dynamic_context(snap: dict) -> str:
                     # Format compact pour le LLM (jamais raw seconds dans le prompt).
                     parts.append(f"Driver history at {track}/{car}: best {fmt_lap_compact(hist['best_lap_ms'])} avg {fmt_lap_compact(hist['avg_lap_ms'])}, weakness {hist.get('weakness_sector','?')} (+{hist.get('weakness_avg_delta_ms',0)/1000:.2f}s avg). Last {hist['n_laps_history']} laps.")
             except Exception: pass
+            # Fix P0.4 brief V3 17/05 nuit : injection KB car/track mini-bloc dans le system prompt.
+            # Auparavant la KB n'etait accessible que via tool call (query_setup_context). Maintenant
+            # un mini-bloc 4-6 lignes (strengths/weaknesses/character) est inclus pour que le LLM
+            # reponde direct sans tool round-trip pour les questions evidentes.
+            try:
+                from tools.acc_knowledge import get_car_knowledge, get_track_knowledge
+                car_kb = get_car_knowledge(car) or {}
+                track_kb = get_track_knowledge(track) or {}
+                kb_bits = []
+                if car_kb:
+                    bb = car_kb.get("bb_range_pct", [])
+                    strengths = car_kb.get("strengths", "")
+                    weaknesses = car_kb.get("weaknesses", "")
+                    if isinstance(strengths, list): strengths = ", ".join(strengths[:3])
+                    if isinstance(weaknesses, list): weaknesses = ", ".join(weaknesses[:3])
+                    if bb or strengths or weaknesses:
+                        kb_bits.append(f"Car {car}: BB {bb} | strengths={strengths[:80]} | weak={weaknesses[:80]}")
+                if track_kb:
+                    df = track_kb.get("downforce_pref", "")
+                    brake_zones = track_kb.get("brake_events", "")
+                    if isinstance(brake_zones, list): brake_zones = ", ".join(str(b)[:30] for b in brake_zones[:3])
+                    if df or brake_zones:
+                        kb_bits.append(f"Track {track}: DF={df} | brake_events={brake_zones[:100]}")
+                if kb_bits:
+                    parts.append("KB: " + " | ".join(kb_bits))
+            except Exception as _kb_err:
+                logger.debug(f"[ctx] kb inject fail: {_kb_err}")
     except Exception as e:
         logger.debug(f"[ctx] driving trace inject fail: {e}")
     return "\n".join(parts)

@@ -304,6 +304,91 @@ def driver_history_patterns(track: str, car: str) -> dict:
     }
 
 
+def deep_driver_memory(track: str, car: str, current_session_id: int | None = None) -> dict:
+    """B.5 brief V3 17/05 nuit : rich cross-session memory pour ce combo car+track.
+    Extension de driver_history_patterns() : ajoute setup_changes history, recurring issues,
+    PB trend over time, optimal tyre pressure observée aux meilleurs laps.
+
+    All queries are SQL on existing tables. Pas de Qdrant ni vector db.
+
+    Usage : query_driver_memory tool exposé au LLM Bono pour brief pre-session et coaching.
+    """
+    base = driver_history_patterns(track, car)
+    if not base.get("has_history"):
+        return base
+    with _lock:
+        c = get_conn()
+        # 1. Setup changes history (table Phase B1)
+        excl_sid = f" AND session_id != {int(current_session_id)}" if current_session_id else ""
+        setup_changes_rows = c.execute(
+            f"""SELECT created_at, field, old_value, new_value, source, reverted_at
+                FROM setup_changes WHERE track=? AND car=? {excl_sid}
+                ORDER BY created_at DESC LIMIT 10""",
+            (track, car)
+        ).fetchall()
+        setup_changes = [dict(r) for r in setup_changes_rows]
+        # 2. Recurring coaching issues (events repeated >= 3x cross-session)
+        excl_sid_e = f" AND e.session_id != {int(current_session_id)}" if current_session_id else ""
+        recurring_rows = c.execute(
+            f"""SELECT e.type, COUNT(*) as occurrences, MAX(e.ts) as last_seen_ts
+                FROM events e JOIN sessions s ON e.session_id = s.id
+                WHERE s.track=? AND s.car=?
+                  AND e.type IN ('understeer_detected','oversteer_detected','track_limits_warning','brake_temp_high','pace_drift','fuel_save_required')
+                  {excl_sid_e}
+                GROUP BY e.type HAVING COUNT(*) >= 3
+                ORDER BY occurrences DESC LIMIT 5""",
+            (track, car)
+        ).fetchall()
+        recurring = [dict(r) for r in recurring_rows]
+        # 3. PB trend over time (best per session, max 20 sessions)
+        excl_sid_s = f" AND s.id != {int(current_session_id)}" if current_session_id else ""
+        pb_trend_rows = c.execute(
+            f"""SELECT s.id as sid, s.started_at, MIN(lh.lap_time_ms) as pb_ms
+                FROM sessions s JOIN lap_history lh ON lh.session_id = s.id
+                WHERE s.track=? AND s.car=? AND lh.valid_lap=1 AND lh.lap_time_ms > 0
+                  {excl_sid_s}
+                GROUP BY s.id ORDER BY s.started_at ASC LIMIT 20""",
+            (track, car)
+        ).fetchall()
+        pb_trend = [dict(r) for r in pb_trend_rows]
+        # 4. Optimal tyre pressure observée aux best laps (top 0.5% laps)
+        excl_sid_l = f" AND session_id != {int(current_session_id)}" if current_session_id else ""
+        opt_psi_row = c.execute(
+            f"""SELECT AVG(tyre_press_avg) as optimal_psi_avg, COUNT(*) as n_laps
+                FROM lap_history WHERE track=? AND car=? AND valid_lap=1 AND lap_time_ms > 0
+                  AND lap_time_ms <= (SELECT MIN(lap_time_ms) * 1.005 FROM lap_history WHERE track=? AND car=? AND valid_lap=1 AND lap_time_ms > 0)
+                  {excl_sid_l}""",
+            (track, car, track, car)
+        ).fetchone()
+        optimal_psi = opt_psi_row["optimal_psi_avg"] if opt_psi_row and opt_psi_row["optimal_psi_avg"] else None
+        n_top_laps = opt_psi_row["n_laps"] if opt_psi_row else 0
+        c.close()
+    # PB trend simplification : juste premier, milieu, dernier pour le LLM
+    trend_summary = None
+    if len(pb_trend) >= 3:
+        first_pb = pb_trend[0]["pb_ms"]
+        last_pb = pb_trend[-1]["pb_ms"]
+        delta_pb = (last_pb - first_pb) / 1000.0
+        trend_summary = {
+            "first_pb_s": round(first_pb / 1000, 3),
+            "last_pb_s": round(last_pb / 1000, 3),
+            "delta_s": round(delta_pb, 3),
+            "n_sessions": len(pb_trend),
+            "improving": delta_pb < 0,
+        }
+    base.update({
+        "has_deep_memory": True,
+        "setup_changes_applied_here": setup_changes,
+        "n_setup_changes_history": len(setup_changes),
+        "recurring_issues": recurring,
+        "pb_trend_over_time": pb_trend,
+        "pb_trend_summary": trend_summary,
+        "tyre_pressure_optimal_observed_psi": round(optimal_psi, 2) if optimal_psi else None,
+        "n_top_laps_sampled": n_top_laps,
+    })
+    return base
+
+
 def log_audio_metric(session_id: int, turn_id: int, duration_s: float, rms: float, peak: float,
                      sample_rate: int, bytes_: int, transcript_len: int, lang_detected: str | None = None):
     if not _validate_session_id("log_audio_metric", session_id):
@@ -324,6 +409,46 @@ def update_pipeline_timing_tts(session_id: int, turn_id: int, tts_ms: int, playb
                      WHERE id = (SELECT id FROM pipeline_timings WHERE session_id=? AND turn_id=? ORDER BY id DESC LIMIT 1)""",
                   (tts_ms, playback_ms, tts_provider, session_id, turn_id))
         c.commit(); c.close()
+
+
+def set_llm_busy(busy: bool):
+    """Fix 0.2 brief V3 17/05 nuit : flag cross-process pour futur strategist_service.
+    runtime_state.llm_busy flippé 0/1 par core_service autour de chaque LLM call.
+    Strategist (process séparé) lira cette valeur via get_llm_busy() pour skip ses fires
+    pendant qu'un PTT consume Anthropic. Evite double facturation et collision queue playback."""
+    with _lock:
+        c = get_conn()
+        c.execute("""CREATE TABLE IF NOT EXISTS runtime_state (
+            id INTEGER PRIMARY KEY,
+            llm_busy INTEGER DEFAULT 0,
+            updated_at REAL
+        )""")
+        c.execute("INSERT OR REPLACE INTO runtime_state(id, llm_busy, updated_at) VALUES (1, ?, ?)",
+                  (1 if busy else 0, time.time()))
+        c.commit(); c.close()
+
+
+def get_llm_busy(stale_after_s: float = 30.0) -> bool:
+    """Read llm_busy flag. Returns False if stale > 30s (assume PTT crashed without releasing)."""
+    with _lock:
+        c = get_conn()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS runtime_state (
+                id INTEGER PRIMARY KEY,
+                llm_busy INTEGER DEFAULT 0,
+                updated_at REAL
+            )""")
+            row = c.execute("SELECT llm_busy, updated_at FROM runtime_state WHERE id=1").fetchone()
+            c.close()
+        except Exception:
+            try: c.close()
+            except: pass
+            return False
+        if not row:
+            return False
+        if time.time() - (row["updated_at"] or 0) > stale_after_s:
+            return False  # stale = fail-open
+        return bool(row["llm_busy"])
 
 
 def log_setup_change(session_id: int | None, turn_id: int | None, track: str, car: str,

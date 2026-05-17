@@ -1312,8 +1312,45 @@ def query_combo_setup_hints(car_id: str = "", track_id: str = "") -> dict:
 
 
 @bono_tool(
+    name="query_driver_memory",
+    description="""B.5/B.6 brief V3 17/05 : DEEP cross-session memory pour ce car+track combo.
+Retourne : driver_history_patterns + setup_changes appliqués ici + recurring issues
+(>=3x cross-session : understeer, track_limits, brake_temp) + PB trend over sessions +
+optimal tyre pressure observée aux meilleurs laps historiques.
+
+USE FOR:
+- Pre-session brief ("Mon histoire sur Spa avec Porsche ?")
+- Coaching context ("Ai-je déjà eu ce souci ?")
+- Setup recommendations basées sur passé
+- PB trend awareness pour gauge progression
+
+DON'T USE FOR:
+- Current session laps only -> use query_recent_laps
+- Real-time telemetry -> use query_telemetry
+- Single-session sector deltas -> use query_sector_performance""",
+    parameters={"type": "object", "properties": {}, "required": []}
+)
+def query_driver_memory() -> dict:
+    """B.6 brief V3 17/05 nuit : DEEP cross-session memory tool exposé au LLM."""
+    s = _snap()
+    track = (s.get("track") or "").strip()
+    car = (s.get("car") or "").strip()
+    sid = s.get("_session_id")
+    if not track or not car:
+        return _err("no_track_car", "Track/car inconnu, ACC pas lancé.", retryable=True)
+    try:
+        mem = _memory()
+        data = mem.deep_driver_memory(track, car, current_session_id=sid)
+    except Exception as e:
+        return _err("db_read_fail", f"DB err: {e}", retryable=True)
+    if not data.get("has_history"):
+        return _err("no_history_yet", f"Pas d'historique cross-session sur {track}/{car}.", retryable=False, n_laps_history=0)
+    return _ok(data)
+
+
+@bono_tool(
     name="query_driver_history",
-    description="V3.J : retrieve driver patterns at this track/car from lap_history (valid rate, weakness sector, cold tyre tendency, best historical lap). Use for pre-session briefing or contextual coaching.",
+    description="[LEGACY — préfère query_driver_memory qui retourne deep memory complet]. Retourne driver patterns basiques (valid rate, weakness sector, best historical lap).",
     parameters={"type": "object", "properties": {}, "required": []}
 )
 def query_driver_history() -> dict:
