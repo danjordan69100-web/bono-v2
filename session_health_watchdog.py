@@ -84,9 +84,16 @@ def audit_session(session_start_ts: float, session_end_ts: float) -> dict:
         issues.append("MoTeC: AUCUN .ld exporté pour cette session. ACC autosave OFF ou session mal terminée.")
 
     # 2. Results JSON nouveau ?
+    # Fix 17/05 nuit : ACC ne génère Results JSON QUE pour sessions officielles (MP race weekend,
+    # Special Events, Championship). PAS pour single-player Practice/Hotlap/Free Practice.
+    # On flagge l'absence seulement si on est sûr d'avoir été en mode officiel.
     new_results = find_new_files_since(RESULTS_DIR, session_start_ts - 60, "*.json")
     info["results_new_json_count"] = len(new_results)
-    if not new_results:
+    # Check session_type via SHM snapshot pour décider si Results attendu
+    snap_now = get_bono_shm_status() or {}
+    session_type_observed = (snap_now.get("session") or "").upper()
+    results_expected = session_type_observed in ("RACE", "QUALIFY")
+    if results_expected and not new_results:
         issues.append("Results: AUCUN session JSON. ACC n'a pas finalisé la session (Alt+F4 ? crash ?).")
 
     # 3. Replay nouveau ? (info, not critical)
