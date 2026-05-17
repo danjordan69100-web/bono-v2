@@ -348,7 +348,7 @@ def main():
         "playback_alive", "playback_cpu_pct", "playback_rss_mb", "playback_pid",
         "input_alive", "input_cpu_pct", "input_rss_mb", "input_pid",
         # ACC process
-        "acc_proc_alive", "acc_cpu_pct", "acc_rss_mb", "acc_pid",
+        "acc_proc_alive", "acc_proc_cpu_pct", "acc_proc_rss_mb", "acc_proc_pid",  # Fix 17/05 nuit : align with proc_metrics(prefix="acc_proc") qui génère acc_proc_*
         # API ping (cached, refreshed periodic)
         "api_anthropic_ms", "api_deepgram_ms", "api_elevenlabs_ms", "api_fish_audio_ms",
     ]
