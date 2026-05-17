@@ -144,6 +144,28 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_timings_session ON pipeline_timings(session_id);
         CREATE INDEX IF NOT EXISTS idx_audio_session ON audio_metrics(session_id);
+        -- Phase B1 brief V3 (17/05) : audit trail des setup modifications par Bono.
+        -- Avant : 20+ bono_engineer_setup_update_acc en session 49, aucun loggué.
+        -- Maintenant : track field, old_value, new_value, source (PTT vs auto), reverted_at.
+        CREATE TABLE IF NOT EXISTS setup_changes (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at      TEXT NOT NULL,
+            session_id      INTEGER,
+            turn_id         INTEGER,
+            track           TEXT,
+            car             TEXT,
+            setup_file      TEXT,        -- full path .json
+            field           TEXT NOT NULL, -- field key (eg "brakeBias", "wing", "tyrePressure_FL")
+            old_value       TEXT,
+            new_value       TEXT,
+            source          TEXT,        -- 'ptt' (driver request) / 'auto' (proactive) / 'manual'
+            success         INTEGER DEFAULT 1,
+            error_msg       TEXT,
+            reverted_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_setup_changes_session ON setup_changes(session_id);
+        CREATE INDEX IF NOT EXISTS idx_setup_changes_track_car ON setup_changes(track, car);
+        CREATE INDEX IF NOT EXISTS idx_setup_changes_created_at ON setup_changes(created_at);
         """)
         c.commit(); c.close()
 
@@ -293,6 +315,21 @@ def update_pipeline_timing_tts(session_id: int, turn_id: int, tts_ms: int, playb
         c.execute("""UPDATE pipeline_timings SET tts_ms=?, playback_ms=?, tts_provider=COALESCE(NULLIF(?,''), tts_provider)
                      WHERE id = (SELECT id FROM pipeline_timings WHERE session_id=? AND turn_id=? ORDER BY id DESC LIMIT 1)""",
                   (tts_ms, playback_ms, tts_provider, session_id, turn_id))
+        c.commit(); c.close()
+
+
+def log_setup_change(session_id: int | None, turn_id: int | None, track: str, car: str,
+                      setup_file: str, field: str, old_value, new_value,
+                      source: str = "ptt", success: bool = True, error_msg: str = ""):
+    """Phase B1 brief V3 17/05 : audit trail des setup modifications."""
+    with _lock:
+        c = get_conn()
+        c.execute("""INSERT INTO setup_changes(created_at,session_id,turn_id,track,car,setup_file,field,old_value,new_value,source,success,error_msg) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                   session_id, turn_id, track, car, setup_file, field,
+                   str(old_value) if old_value is not None else None,
+                   str(new_value) if new_value is not None else None,
+                   source, 1 if success else 0, error_msg))
         c.commit(); c.close()
 
 

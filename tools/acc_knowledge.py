@@ -7,6 +7,49 @@ CRITICAL : tout conseil setup/driving voiture-specifique DOIT consulter ces donn
 au lieu de génériquer. Sinon Bono = "ChatGPT racing", pas vrai ingé.
 """
 
+# Phase C prereq brief V3 17/05 : PSI mapping formula ACC.
+# Source : community ACC consensus (forum AC, Reddit r/ACCompetizione, Kunos manual).
+# IMPORTANT : conversion VÉRIFIÉE valide pour ACC 1.9+ Pirelli DHF mais ASSUMPTION sur cold→hot.
+# Cold→Hot delta réel dépend de : track temp, surface, stress (qualif vs race), set fresh vs used.
+# Valeur 2.0 PSI = approximation moyenne piste sec 25-30°C track temp. À AJUSTER par track météo.
+#
+# Formule ACC setup JSON :
+#   click_value (entier 0-100+ dans le JSON setup) → PSI_cold = 20.3 + click_value * 0.1
+#   PSI_hot ≈ PSI_cold + COLD_TO_HOT_DELTA (default 2.0 PSI ; range observée 1.5-2.5)
+#
+# Exemples :
+#   click=45 → cold=24.8 → hot≈26.8 (Pirelli DHF target sec piste tempérée)
+#   click=50 → cold=25.3 → hot≈27.3 (chaude piste)
+#   click=40 → cold=24.3 → hot≈26.3 (race start, fraîche)
+ACC_PSI_BASE_COLD = 20.3
+ACC_PSI_PER_CLICK = 0.1
+ACC_COLD_TO_HOT_DELTA_DEFAULT = 2.0
+
+
+def click_to_psi_cold(click_value: int) -> float:
+    """Click ACC setup → PSI cold (à la sortie des stands, pneus froids)."""
+    return round(ACC_PSI_BASE_COLD + click_value * ACC_PSI_PER_CLICK, 2)
+
+
+def click_to_psi_hot(click_value: int, cold_to_hot_delta: float = ACC_COLD_TO_HOT_DELTA_DEFAULT) -> float:
+    """Click ACC setup → PSI hot (en course, après warmup). Approximation."""
+    return round(click_to_psi_cold(click_value) + cold_to_hot_delta, 2)
+
+
+def psi_hot_target_to_click(psi_hot_target: float, cold_to_hot_delta: float = ACC_COLD_TO_HOT_DELTA_DEFAULT) -> int:
+    """PSI hot target (e.g. 26.8 Pirelli DHF) → click value à mettre dans setup ACC."""
+    psi_cold = psi_hot_target - cold_to_hot_delta
+    click_float = (psi_cold - ACC_PSI_BASE_COLD) / ACC_PSI_PER_CLICK
+    return max(0, round(click_float))
+
+
+# TODO Phase C runtime validation : tester avec setup BMW M4 GT3 Monza :
+#   1. Ouvrir un setup avec tyrePressure=[45,45,45,45]
+#   2. Faire un out-lap + 2 push laps
+#   3. Lire snap.tyre_press_fl/fr/rl/rr en hot (telemetry SHM)
+#   4. Vérifier que ~26.8 PSI obs ≈ click_to_psi_hot(45) = 26.8
+#   5. Si écart > 0.5 PSI, ajuster ACC_COLD_TO_HOT_DELTA_DEFAULT
+
 # ============================================================
 # CARS — ACC GT3 (2026 season car list)
 # ============================================================

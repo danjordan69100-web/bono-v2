@@ -287,8 +287,33 @@ PERMISSION POSTURE:
 - Everything else: engage like smart friend (racing, life, philosophy, AI, jokes, opinions).
 - Can say "I'm an AI race engineer" if asked directly.
 
+{primary_mindset}
+
 [DYNAMIC_CONTEXT]
 {dynamic_context}"""
+
+
+# Phase B2 brief V3 17/05 : "primary_mindset" injecté juste avant le dynamic context.
+# Persona race/practice split sans dupliquer 21KB — on injecte 3-5 lignes ciblées en fonction
+# de la session active. Le LLM voit cela en TÊTE du contexte → max d'impact behavior.
+PRIMARY_MINDSETS = {
+    "PRACTICE": """[PRIMARY MINDSET: PRACTICE] Free exploration, no chrono pressure. Help driver experiment with setup, learn the track, build pace. Speak only when asked or for safety. Coaching tone is "essayer / observer / corriger".""",
+    "QUALIFY": """[PRIMARY MINDSET: QUALIFY] Single push lap mindset. Silence during the lap unless safety/yellow. Pre-lap : confirm tyres warm + fuel just enough. Post-lap : sector deltas vs best, brief verdict. Tone is sharp, minimal words.""",
+    "RACE": """[PRIMARY MINDSET: RACE] Strategic race engineer. Be PROACTIVE about gaps, position changes, fuel save, undercut windows, tyre wear, pit timing. Use bono_pit_decision tool when pit window approaches. Tone is "pilote stratège" — give edge, not just data.""",
+    "HOTLAP": """[PRIMARY MINDSET: HOTLAP] Pure chrono attack, no opponents. Verbose post-lap analysis OK. Coaching focus = sector deltas + driving trace anomalies (slip, brake_max).""",
+    "HOTSTINT": """[PRIMARY MINDSET: HOTSTINT] Multi-lap time attack, tyre management mid-stint. Coach on consistency + tyre cliff timing.""",
+}
+
+
+def _resolve_primary_mindset(dynamic_context: str) -> str:
+    """Extract session_type from dynamic_context first line ('Session: RACE (status=LIVE)') and pick mindset."""
+    if not dynamic_context: return ""
+    for line in dynamic_context.split("\n")[:8]:
+        upper = line.upper()
+        for key in PRIMARY_MINDSETS:
+            if f"SESSION: {key}" in upper or f"SESSION:{key}" in upper:
+                return PRIMARY_MINDSETS[key]
+    return ""
 
 
 def _build_tools_section(tools_schemas: list[dict] | None = None) -> str:
@@ -308,10 +333,12 @@ def _build_tools_section(tools_schemas: list[dict] | None = None) -> str:
 
 def build_system_prompt(dynamic_context: str = "", tools_schemas: list[dict] | None = None) -> str:
     tools_section = _build_tools_section(tools_schemas)
+    primary_mindset = _resolve_primary_mindset(dynamic_context)
     return SYSTEM_PROMPT_TEMPLATE.format(
         persona_name=PERSONA_NAME,
         persona_tone=PERSONA_TONE,
         persona_catch=PERSONA_CATCH,
         tools_section=tools_section,
+        primary_mindset=primary_mindset,
         dynamic_context=dynamic_context or "(no live context yet)",
     )

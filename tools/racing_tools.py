@@ -514,12 +514,38 @@ def bono_engineer_setup_update_acc(field: str, delta: float = 0, absolute_value:
         node[last] = new_val
         with open(target, "w", encoding="utf-8") as f:
             _json.dump(data, f, indent=4)
+        # Phase B1 brief V3 17/05 : audit trail des modifications setup
+        try:
+            mem = _memory()
+            sid = None
+            try:
+                import sys as _sys
+                if 'core_service' in _sys.modules:
+                    sid = _sys.modules['core_service']._state.session_id
+            except Exception: pass
+            mem.log_setup_change(session_id=sid, turn_id=None, track=track, car=car,
+                                 setup_file=_o.path.basename(target), field=field,
+                                 old_value=old_val, new_value=new_val, source="ptt", success=True)
+        except Exception as _e:
+            pass  # never block on audit log fail
         return {"ok": True, "field": field, "delta": effective_delta, "old": old_val, "new": new_val,
                 "absolute_mode": absolute_value is not None,
                 "file": _o.path.basename(target), "backup": bk_name, "in_range": rng}
     except Exception as e:
         # restore backup on failure
         try: _shutil.copy2(bk_path, target)
+        except Exception: pass
+        # Audit trail aussi en cas d'erreur (visibilité)
+        try:
+            mem = _memory()
+            sid = None
+            import sys as _sys
+            if 'core_service' in _sys.modules:
+                sid = _sys.modules['core_service']._state.session_id
+            mem.log_setup_change(session_id=sid, turn_id=None, track=track, car=car,
+                                 setup_file=_o.path.basename(target) if 'target' in locals() else '',
+                                 field=field, old_value=None, new_value=None,
+                                 source="ptt", success=False, error_msg=str(e)[:200])
         except Exception: pass
         return {"ok": False, "error_code": "edit_fail", "retryable": True,
                 "human_message": f"Edit raté, backup restauré. Erreur : {e}"}
@@ -579,6 +605,111 @@ def query_setup_state(fields: list | None = None) -> dict:
         return _ok(result)
     except Exception as e:
         return _err("read_fail", f"Lecture setup err: {e}", retryable=True)
+
+
+# ============================================================
+# grid_engineer_audit : Phase C brief V3 17/05 — audit setup pre-race
+# ============================================================
+@bono_tool(
+    name="grid_engineer_audit",
+    description="GRID ENGINEER MODE pre-race : audit du current setup vs car/track knowledge base. Compare brake bias, ARB, wing, tyre pressure (hot target Pirelli DHF), fuel calc. Retourne suggestions chiffrées. USE WHEN driver demande 'audit setup' / 'check setup' / 'recommandations setup' / avant un départ.",
+    parameters={"type": "object", "properties": {
+        "laps_to_finish": {"type": "integer", "description": "Optional race target laps (for fuel calc). 0 = ignore fuel audit."}
+    }, "required": []}
+)
+def grid_engineer_audit(laps_to_finish: int = 0) -> dict:
+    """Compare current setup vs KB. Suggests deltas with reasoning."""
+    from tools.acc_knowledge import (
+        get_car_knowledge, get_track_knowledge, get_combo_hint,
+        click_to_psi_hot, psi_hot_target_to_click,
+    )
+    s = _snap()
+    car = (s.get("car") or "").strip()
+    track = (s.get("track") or "").strip()
+    if not car or not track:
+        return _err("no_car_or_track", "Pas de car/track dans SHM, ACC pas lancé?", retryable=True)
+    car_kb = get_car_knowledge(car) or {}
+    track_kb = get_track_knowledge(track) or {}
+    combo_hint = get_combo_hint(car, track) or {}
+    # Read current setup
+    state = query_setup_state()
+    if not state.get("ok"):
+        return state
+    audit = []  # list of {field, current, target, delta, severity, reason}
+    # 1. Brake bias
+    bb_cur = state.get("brakeBias")
+    bb_range = car_kb.get("bb_range_pct")
+    if bb_cur is not None and bb_range:
+        # ACC brakeBias stocké = (BB_pct - 50) * 10 (scale int)
+        bb_pct_cur = round(50 + bb_cur / 10.0, 1)
+        bb_target = (combo_hint.get("bb_target_pct") if combo_hint else None) or (bb_range[0] + bb_range[1]) / 2
+        if not (bb_range[0] <= bb_pct_cur <= bb_range[1]):
+            audit.append({"field": "brakeBias", "current_pct": bb_pct_cur, "target_pct": bb_target,
+                          "allowed_range": bb_range, "severity": "high",
+                          "reason": f"BB {bb_pct_cur}% hors range {car} ({bb_range[0]}-{bb_range[1]}%)"})
+        elif abs(bb_pct_cur - bb_target) > 1.0:
+            audit.append({"field": "brakeBias", "current_pct": bb_pct_cur, "target_pct": bb_target,
+                          "severity": "medium",
+                          "reason": f"BB {bb_pct_cur}% éloigné target combo {bb_target}%"})
+    # 2. Tyre pressure (per wheel)
+    tp_cur = state.get("tyrePressure") or []
+    tp_targets = car_kb.get("tyre_pressure_target_hot_psi") or {}
+    if isinstance(tp_cur, list) and len(tp_cur) == 4 and tp_targets:
+        labels = ("FL", "FR", "RL", "RR")
+        for i, lbl in enumerate(labels):
+            psi_hot_obs = click_to_psi_hot(int(tp_cur[i]))
+            psi_target = tp_targets.get(lbl, 26.8)
+            delta_psi = round(psi_hot_obs - psi_target, 2)
+            if abs(delta_psi) > 0.3:  # > 0.3 PSI = écart significatif
+                click_target = psi_hot_target_to_click(psi_target)
+                audit.append({"field": f"tyrePressure_{lbl}", "current_click": tp_cur[i],
+                              "current_psi_hot_est": psi_hot_obs, "target_psi_hot": psi_target,
+                              "delta_psi": delta_psi, "suggested_click": click_target,
+                              "delta_clicks": click_target - int(tp_cur[i]),
+                              "severity": "high" if abs(delta_psi) > 0.6 else "medium",
+                              "reason": f"PSI hot estimé {psi_hot_obs} vs target {psi_target} (Pirelli DHF)"})
+    # 3. Rear wing
+    wing_cur = state.get("rearWing")
+    wing_target = (combo_hint.get("wing_target") if combo_hint else None)
+    if wing_cur is not None and wing_target is not None and abs(wing_cur - wing_target) > 1:
+        audit.append({"field": "rearWing", "current": wing_cur, "target": wing_target,
+                      "delta": wing_target - wing_cur, "severity": "medium",
+                      "reason": f"Wing {wing_cur} vs combo target {wing_target} ({track_kb.get('downforce_pref','?')} DF preference)"})
+    # 4. ARB front/rear vs car preference
+    for arb_label, kb_key in [("aRBFront", "arb_front_pref"), ("aRBRear", "arb_rear_pref")]:
+        arb_cur = state.get(arb_label)
+        arb_pref = car_kb.get(kb_key)
+        if arb_cur is not None and arb_pref:
+            if not (arb_pref[0] <= arb_cur <= arb_pref[1]):
+                audit.append({"field": arb_label, "current": arb_cur, "target_range": arb_pref,
+                              "severity": "medium",
+                              "reason": f"{arb_label} {arb_cur} hors préf {car} ({arb_pref[0]}-{arb_pref[1]})"})
+    # 5. Fuel for race
+    if laps_to_finish > 0:
+        fuel_cur_setup = state.get("fuel")  # litres entiers
+        fuel_per_lap_obs = s.get("fuel_per_lap", 0) or 0
+        if fuel_per_lap_obs > 0.1 and fuel_cur_setup is not None:
+            fuel_needed = round(laps_to_finish * fuel_per_lap_obs + 2, 1)  # +2L safety
+            if abs(fuel_cur_setup - fuel_needed) > 1.5:
+                audit.append({"field": "fuel", "current_l": fuel_cur_setup, "target_l": fuel_needed,
+                              "delta_l": round(fuel_needed - fuel_cur_setup, 1), "severity": "high",
+                              "reason": f"Fuel {fuel_cur_setup}L vs besoin estimé {fuel_needed}L ({laps_to_finish} laps × {fuel_per_lap_obs:.2f}L/lap + 2L safety)"})
+    # Summary
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for a in audit:
+        severity_counts[a.get("severity", "medium")] += 1
+    return _ok({
+        "track": track, "car": car,
+        "setup_file": state.get("setup_file"),
+        "n_issues": len(audit),
+        "severity_breakdown": severity_counts,
+        "audit": audit,
+        "overall_verdict": (
+            "Setup OK, peu/pas d'ajustements." if not audit
+            else f"{severity_counts['high']} ajustements critiques, {severity_counts['medium']} mineurs recommandés."
+        ),
+        "note_psi_caveat": "PSI hot estimations utilisent COLD_TO_HOT_DELTA=2.0 PSI (approximation moyenne). Variations possibles selon track temp.",
+    })
 
 
 # ============================================================

@@ -121,6 +121,12 @@ _state.last_seen_opponents = {}
 _state.laps_remaining_announced = set()
 _state_lock = threading.Lock()  # for current_turn_id
 
+# Phase A1 (brief V3 17/05) : mutex GLOBAL pour serialiser tous les appels Anthropic.
+# Prévient race condition entre handle_ptt (réactif) et futur strategist_service (proactif).
+# Sans ce lock, 2 LLM calls concurrents = double facturation, risque message coupé,
+# explosion latence (Anthropic API a une rate limit per-account, pas per-thread).
+_llm_global_lock = threading.Lock()
+
 
 # Anthropic pricing per million tokens (haiku/sonnet/opus 4.5/4.6/4.7)
 ANTHROPIC_COSTS = {
@@ -815,6 +821,69 @@ def detect_auto_events(snap: dict):
             msg = f"Pneus à {wear_pct} pourcent, attention au cliff."
         fire_event("tyre_cliff", "warn", msg, {"wear": wears, "max_wear": round(max_wear, 3), "band": band, "session": session_type}, ttl_s=20)
 
+    # --- Phase D-light brief V3 17/05 : 3 observers strategist (RACE only) ---
+    # Architecture : pas de service séparé (trop ambitieux pour un soir). On utilise hysteresis_check
+    # + détection delta lap. Mutex LLM global (_llm_global_lock) garantit pas de race avec PTT.
+    if is_race:
+        # OBSERVER 1 — pace_drift : si avg 3 derniers laps > best + 2%, c'est un drift.
+        if _state.session_id and laps >= 4:
+            try:
+                recent = memory.get_recent_laps(_state.session_id, n=5)
+                valid_recent = [l for l in recent if l.get("valid_lap") and l.get("lap_time_ms", 0) > 0]
+                if len(valid_recent) >= 3:
+                    times = [l["lap_time_ms"] for l in valid_recent[-3:]]
+                    avg_recent = sum(times) / len(times)
+                    best_session = snap.get("best_time_ms", 0)
+                    if best_session > 0:
+                        drift_pct = (avg_recent - best_session) / best_session
+                        band = f"drift_{int(drift_pct*100)}_lap{laps}"
+                        if hysteresis_check("pace_drift",
+                                             condition=(drift_pct > 0.02),
+                                             exit_condition=(drift_pct < 0.012),
+                                             confirm_delay_s=0,
+                                             dedup_key=band, cooldown_s=120):
+                            delta_s = (avg_recent - best_session) / 1000.0
+                            fire_event("pace_drift", "info",
+                                       f"Tu perds {fmt_delta_fr(delta_s)} vs ton meilleur sur les trois derniers tours, vérifie ton rythme.",
+                                       {"avg_3_ms": int(avg_recent), "best_ms": best_session, "drift_pct": round(drift_pct, 3), "session": session_type}, ttl_s=12)
+            except Exception as e:
+                logger.debug(f"[observer.pace_drift] {e}")
+
+        # OBSERVER 2 — undercut_window : car ahead à <2s ET pit_window_open (fuel_laps 5-10)
+        # Si on a fuel pour pit et qu'on est proche du car ahead = bonne chance d'undercut.
+        gap_a = snap.get("gap_ahead_ms", 0) or 0
+        fuel_laps_remaining = snap.get("fuel_estimated_laps", 0) or 0
+        if 0 < gap_a < 2000 and 5 < fuel_laps_remaining < 10:
+            if hysteresis_check("undercut_window",
+                                 condition=True,
+                                 exit_condition=(gap_a > 3500 or fuel_laps_remaining < 4 or fuel_laps_remaining > 11),
+                                 confirm_delay_s=2.0,
+                                 dedup_key=f"gap_{int(gap_a/500)}_fuel_{int(fuel_laps_remaining)}",
+                                 cooldown_s=180):
+                fire_event("undercut_window", "info",
+                           f"Fenêtre undercut ouverte : voiture devant à {gap_a/1000:.1f}s et tu as {int(fuel_laps_remaining)} tours d'essence. Pit dans 2-3 tours possible.",
+                           {"gap_ahead_ms": gap_a, "fuel_laps": fuel_laps_remaining, "session": session_type}, ttl_s=15)
+
+        # OBSERVER 3 — fuel_save_required : si fuel_laps < laps_restants_estimes course
+        # Pas trivial sans laps_total race. Heuristique : si fuel_laps < 80% des laps restants estimés par session_time_left/avg_lap_time
+        session_time_left_s = snap.get("session_time_left_s", 0) or 0
+        last_time_ms = snap.get("last_time_ms", 0) or 0
+        if session_time_left_s > 60 and last_time_ms > 30000 and fuel_laps_remaining > 0:
+            laps_remaining_session = session_time_left_s / (last_time_ms / 1000.0)
+            fuel_deficit = laps_remaining_session - fuel_laps_remaining
+            if fuel_deficit > 0.5:
+                save_needed_pct = round(fuel_deficit / max(laps_remaining_session, 1) * 100, 1)
+                band = f"deficit_{int(fuel_deficit)}_lap{laps}"
+                if hysteresis_check("fuel_save_required",
+                                     condition=(fuel_deficit > 0.5),
+                                     exit_condition=(fuel_deficit < 0.2),
+                                     confirm_delay_s=3.0,
+                                     dedup_key=band, cooldown_s=240):
+                    fire_event("fuel_save_required", "warn",
+                               f"Fuel save nécessaire, déficit estimé {fuel_deficit:.1f} tour. Lift et coast aux droites longues.",
+                               {"fuel_laps": fuel_laps_remaining, "laps_remaining_estimated": round(laps_remaining_session, 1),
+                                "deficit_laps": round(fuel_deficit, 2), "save_pct": save_needed_pct, "session": session_type}, ttl_s=18)
+
     # --- spotter_close auto-event RETIRÉ 17/05 ---
     # Consensus unanime Gemini 3.1 Pro + GPT-5.4 + GLM 5.1 (audit Bono V5 17/05) :
     # "anti-pattern absolu — LLM/TTS pipeline a 5s+ latence, ne peut PAS faire spotter à 10m".
@@ -1344,7 +1413,7 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
     sentences to TTS progressively (every "." or "?" or "!" with min 15 chars). For hops with
     tool_use, we still wait for final_msg (tools require complete response).
     """
-    dynamic_ctx = build_dynamic_context(snap)
+    dynamic_ctx = build_dynamic_context_cached(snap)  # Phase A2 brief V3 : TTL 5s cache
     sys_prompt = build_system_prompt(dynamic_ctx, tools_schemas=get_all_schemas())
     is_french = any(c in transcript for c in "éèêàçâîôûùœ") or any(w in transcript.lower().split() for w in ("je","tu","mon","mes","ça","c'est","pneu","pneus","essence","carburant","tours","écart"))
     model_id = ANTHROPIC_MODELS["deep"] if any(w in transcript.lower() for w in ("explique","analyse","détail","compare","why","explain","debrief")) else ANTHROPIC_MODELS["fast"]
@@ -1422,7 +1491,10 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
             # Fix 17/05 instrumentation : capture TTFT (Time-To-First-Token) — auparavant llm_ttft_ms=0 partout.
             _ttft_ms_hop = 0
             _first_delta_ts = None
-            with anthropic_client.messages.stream(
+            # Phase A1 brief V3 : mutex global LLM. Sérialise vs futur strategist proactif.
+            # Notes : on tient le lock pendant tout le streaming (cohérent — 1 conversation à la fois).
+            # Si strategist veut parler en parallèle, il attendra ici (acceptable : strategist = async).
+            with _llm_global_lock, anthropic_client.messages.stream(
                 model=model_id, max_tokens=LLM_MAX_TOKENS, temperature=temperature,
                 system=system_blocks, tools=cached_tools, messages=messages,
                 extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
@@ -1578,6 +1650,38 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
                 # V2.3 GLM reco : reconnect socket if persistent block
                 logger.warning("[ptt] zmq.Again persistent — consider playback service health check")
             except Exception: pass
+
+
+# Phase A2 brief V3 (17/05) : cache dynamic_context avec TTL 5s.
+# build_dynamic_context fait des queries SQL (driving_trace, recent_laps, driver_history) à chaque appel
+# (3 queries × ~5ms = 15ms + format). Multiplié par turn LLM + auto-events qui rebuilent =
+# coût SQL inutile + tokens recomputés à l'identique. TTL 5s : la télémétrie ACC bouge à 30Hz
+# mais le LLM context bouge en pratique au lap suivant (~2 min). 5s = juste assez frais.
+_dyn_ctx_cache: dict[str, tuple[float, str]] = {}  # key -> (ts, content)
+_dyn_ctx_lock = threading.Lock()
+_DYN_CTX_TTL_S = 5.0
+
+
+def build_dynamic_context_cached(snap: dict) -> str:
+    """Wrapper cached. Key = signature minimale du snap (lap, position, session)."""
+    if not snap or not snap.get("shm_ok") or snap.get("status") == "OFF":
+        # No cache for OFF state — short response inline
+        return build_dynamic_context(snap)
+    key = f"{snap.get('track','?')}|{snap.get('car','?')}|{snap.get('session','?')}|{snap.get('completed_laps',0)}|{snap.get('position',0)}|{int(snap.get('fuel_l',0))}"
+    now = time.time()
+    with _dyn_ctx_lock:
+        cached = _dyn_ctx_cache.get(key)
+        if cached and (now - cached[0]) < _DYN_CTX_TTL_S:
+            return cached[1]
+    # Cache miss : rebuild (hors lock pour ne pas bloquer)
+    content = build_dynamic_context(snap)
+    with _dyn_ctx_lock:
+        _dyn_ctx_cache[key] = (now, content)
+        # Garbage collect entries > 60s (évite leak mémoire si SHM change beaucoup)
+        if len(_dyn_ctx_cache) > 50:
+            stale = [k for k, (ts, _) in _dyn_ctx_cache.items() if now - ts > 60]
+            for k in stale: _dyn_ctx_cache.pop(k, None)
+    return content
 
 
 def build_dynamic_context(snap: dict) -> str:
