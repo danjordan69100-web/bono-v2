@@ -909,7 +909,10 @@ def detect_auto_events(snap: dict):
         bt_max = max(bt) if bt else 0
         bt_avg = sum(bt) / 4 if bt else 0
         now = time.time()
-        if bt_max > 700 and (now - _state.last_brake_temp_event_ts) > 45:
+        # Fix anti-spam 17/05 nuit : cooldown 45s -> 180s + threshold 700 -> 720 (vrai surchauffe)
+        # Session Zolder 17/05 18:00-18:24 : 26 brake_temp_high en 28 min (1 toutes les ~60s).
+        # Spam confirmé. Freins restent chauds = pas besoin de répéter chaque tour.
+        if bt_max > 720 and (now - _state.last_brake_temp_event_ts) > 180:
             fire_event("brake_temp_high", "warn", f"Freins chauds, {int(bt_max)} degrés, attention au fade.",
                        {"max_c": round(bt_max, 0), "avg_c": round(bt_avg, 0), "session": session_type}, ttl_s=15)
             _state.last_brake_temp_event_ts = now
@@ -929,7 +932,15 @@ def detect_auto_events(snap: dict):
         yaw = snap.get("yaw_rate_rad_s", 0)
         now = time.time()
         # V5 audit : U/O detect en PRACTICE/HOTLAP only (race = trop bavard, quali = ne sert pas)
-        if v > 80 and abs(steer) > 0.15 and (now - _state.last_uo_event_ts) > 30 and (is_practice or is_hotlap):
+        # Fix anti-spam 17/05 nuit : cooldown 30s -> 150s + dedup par lap.
+        # Session Zolder 17/05 : 45 understeer_detected sur 28 min = 1.6/min. Spam massif.
+        # Le pattern "BMW sous-vire chaque virage" = pas besoin de répéter. 1 fois par lap suffit.
+        _current_lap = snap.get("completed_laps", 0)
+        _last_uo_lap = getattr(_state, "_last_uo_lap", -1)
+        if (v > 80 and abs(steer) > 0.15
+            and (now - _state.last_uo_event_ts) > 150
+            and _current_lap != _last_uo_lap
+            and (is_practice or is_hotlap)):
             # wheelbase dynamique selon car_kb (Fix 0.4 brief V3 17/05 nuit)
             # Avant : hardcoded 2.85m (BMW M4). Porsche 992 = 2.46m, Mercedes AMG = 2.66m.
             # Erreur ±15% sur expected_yaw selon la voiture → understeer/oversteer mal calibré.
@@ -947,11 +958,13 @@ def detect_auto_events(snap: dict):
                                "La voiture sous-vire, baisse l'angle ou ouvre plus tôt.",
                                {"ratio": round(ratio, 2), "speed_kmh": round(v, 0), "session": session_type}, ttl_s=8)
                     _state.last_uo_event_ts = now
+                    _state._last_uo_lap = _current_lap  # dedup par lap (fix anti-spam 17/05 nuit)
                 elif ratio > 1.7:  # oversteer
                     fire_event("oversteer_detected", "warn",
                                "La voiture sur-vire, ferme un peu en sortie.",
                                {"ratio": round(ratio, 2), "speed_kmh": round(v, 0), "session": session_type}, ttl_s=8)
                     _state.last_uo_event_ts = now
+                    _state._last_uo_lap = _current_lap
     except Exception as e:
         logger.debug(f"[uo] err: {e}")
 
@@ -1201,14 +1214,24 @@ def detect_auto_events(snap: dict):
         _state.chequered_announced = True
 
     # --- V5 Damage warning ---
+    # Fix anti-spam 17/05 nuit : cooldown 60s + threshold delta 5 -> 15 + dedup.
+    # Session Zolder 17/05 : 7 damage_warning en 0.6s d'intervalle moyen = burst chronique
+    # (1 contact = 5-8 events car damage progresse ticks SHM consécutifs).
     try:
         damage = (snap.get("car_damage_front", 0) + snap.get("car_damage_rear", 0) +
                   snap.get("car_damage_left", 0) + snap.get("car_damage_right", 0) +
                   snap.get("car_damage_center", 0))
-        if damage > _state.last_damage_total + 5 and damage > 5:
+        now = time.time()
+        _last_damage_ts = getattr(_state, "_last_damage_event_ts", 0)
+        # Delta threshold relevé à 15 (vrai contact > effleurement) + cooldown 60s anti-burst
+        if (damage > _state.last_damage_total + 15
+            and damage > 10
+            and (now - _last_damage_ts) > 60):
+            delta = damage - _state.last_damage_total
             fire_event("damage_warning", "warn",
                        f"Contact détecté, dommages augmentés. Vérifie ton ressenti voiture.",
-                       {"damage_total": round(damage, 1), "delta": round(damage - _state.last_damage_total, 1), "session": session_type}, ttl_s=15)
+                       {"damage_total": round(damage, 1), "delta": round(delta, 1), "session": session_type}, ttl_s=15)
+            _state._last_damage_event_ts = now
         _state.last_damage_total = damage
     except Exception: pass
 
