@@ -175,6 +175,8 @@ def log_pipeline_timing(session_id: int, turn_id: int, stt_ms: int, stt_provider
                          tts_ms: int, tts_provider: str, playback_ms: int,
                          total_e2e_ms: int, tools_used: list, tools_parallel: int,
                          tokens_in: int, tokens_out: int, cost_usd: float, cache_hit: bool):
+    if not _validate_session_id("log_pipeline_timing", session_id):
+        return
     with _lock:
         c = get_conn()
         c.execute("""INSERT INTO pipeline_timings(ts,session_id,turn_id,stt_ms,stt_provider,llm_ttft_ms,llm_total_ms,llm_model,tts_ms,tts_provider,playback_ms,total_e2e_ms,tools_used,tools_parallel,tokens_in,tokens_out,cost_usd,cache_hit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -189,6 +191,8 @@ def log_lap_metric(session_id: int, lap_num: int, lap_time_ms: int,
                    tyre_press_avg: float = 0.0, tyre_temp_avg: float = 0.0, tyre_wear_max: float = 0.0,
                    valid_lap: bool = True, track: str = "", car: str = ""):
     """V3.B : log one completed lap snapshot for trend/strategy/coaching analysis."""
+    if not _validate_session_id("log_lap_metric", session_id):
+        return
     with _lock:
         c = get_conn()
         c.execute("""INSERT INTO lap_history(ts,session_id,lap_num,lap_time_ms,s1_ms,s2_ms,s3_ms,position,gap_ahead_ms,gap_behind_ms,fuel_l,fuel_per_lap,tyre_press_avg,tyre_temp_avg,tyre_wear_max,valid_lap,track,car) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -224,6 +228,8 @@ def log_driving_trace(session_id: int, lap_num: int, sector_index: int,
                       wheel_slip_max: float, tc_active_pct: float, abs_active_pct: float,
                       track: str = "", car: str = ""):
     """V3.O : log per-sector driving trace for coaching."""
+    if not _validate_session_id("log_driving_trace", session_id):
+        return
     with _lock:
         c = get_conn()
         c.execute("""INSERT INTO driving_trace(ts,session_id,lap_num,sector_index,speed_min_kmh,speed_min_at_position,brake_max_pct,throttle_release_position,wheel_slip_max,tc_active_pct,abs_active_pct,track,car) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -300,6 +306,8 @@ def driver_history_patterns(track: str, car: str) -> dict:
 
 def log_audio_metric(session_id: int, turn_id: int, duration_s: float, rms: float, peak: float,
                      sample_rate: int, bytes_: int, transcript_len: int, lang_detected: str | None = None):
+    if not _validate_session_id("log_audio_metric", session_id):
+        return
     with _lock:
         c = get_conn()
         c.execute("""INSERT INTO audio_metrics(ts,session_id,turn_id,duration_s,rms,peak,sample_rate,bytes,transcript_len,lang_detected) VALUES (?,?,?,?,?,?,?,?,?,?)""",
@@ -338,6 +346,10 @@ def log_system_snapshot(session_id: int, event_id: int, snap: dict):
     n'écrivait dedans. Cette function persiste l'état véhicule au moment où un event fire
     (corrélation event ↔ state pour le post-session debrief : 'à quoi ressemblait la voiture
     quand le yellow_flag a fired ?')."""
+    if not _validate_session_id("log_system_snapshot", session_id):
+        return
+    if not event_id:  # event_id=0 venant de log_event qui a échoué le check session
+        return
     with _lock:
         c = get_conn()
         c.execute("""INSERT INTO system_snapshot_at_event(ts,session_id,event_id,speed_kmh,rpm,gear,position,lap,fuel_l,tyre_press_avg,tyre_temp_avg) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -444,8 +456,23 @@ def update_session_meta(session_id: int, track: str = "", car: str = "", session
         c.commit(); c.close()
 
 
+def _validate_session_id(fn_name: str, session_id):
+    """Audit R1 17/05 nuit : warn si session_id None → data écrite avec NULL = perdue en queries.
+    Return False si invalid (caller skip l'insert)."""
+    if session_id is None or session_id == 0:
+        try:
+            from loguru import logger
+            logger.debug(f"[memory.{fn_name}] session_id={session_id} invalid, skipping log")
+        except Exception:
+            pass
+        return False
+    return True
+
+
 def log_exchange(session_id: int, driver_msg: str, bono_msg: str,
                  model: str, tools_used: list, tokens_in: int, tokens_out: int, latency_ms: int):
+    if not _validate_session_id("log_exchange", session_id):
+        return
     with _lock:
         c = get_conn()
         c.execute("INSERT INTO exchanges(ts,session_id,driver_msg,bono_msg,model,tools_used,tokens_in,tokens_out,latency_ms) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -454,7 +481,10 @@ def log_exchange(session_id: int, driver_msg: str, bono_msg: str,
 
 
 def log_event(session_id: int, type_: str, severity: str = "info", payload: dict | None = None) -> int:
-    """Returns event_id of the inserted row (used by log_system_snapshot for corrélation)."""
+    """Returns event_id of the inserted row (used by log_system_snapshot for corrélation).
+    Returns 0 if session_id invalid (no DB write)."""
+    if not _validate_session_id("log_event", session_id):
+        return 0
     with _lock:
         c = get_conn()
         cur = c.execute("INSERT INTO events(ts,session_id,type,severity,payload) VALUES (?,?,?,?,?)",
