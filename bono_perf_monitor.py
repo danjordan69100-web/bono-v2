@@ -357,7 +357,12 @@ def main():
 
     t_start = time.time()
     # V3 : auto-stop when ACC has been off for >60s (auto-trigger analyze post-session)
+    # Fix 17/05 (B5 audit) : avant ce fix, perf_monitor crashait à 60s si ACC pas encore lancé au boot
+    # → CSV vide pour toute la session (session 49 Monza 17/05 a 6 lignes seulement).
+    # Correction : `acc_seen_live` tracker — on autorise auto-stop UNIQUEMENT après avoir vu ACC LIVE au moins une fois.
+    # Tant qu'ACC n'a jamais été détecté, on attend indéfiniment (wait-loop) sans terminer.
     acc_off_since = 0.0
+    acc_seen_live = False  # passe à True dès qu'on observe acc_proc_alive ou acc_shm_ok
     AUTO_STOP_AFTER_ACC_OFF_S = 60
     # Bug 1 fix : track les valeurs ACC observées EN COURS (pas seulement au boot)
     # → permet de renommer le CSV à la fin avec le vrai track/car même si ACC pas encore up au start
@@ -409,15 +414,21 @@ def main():
                 if int(t_now - t_start) % 10 == 0:
                     print(f"[perf] {row['uptime_s']:6.0f}s | cpu={row['cpu_pct']}% ram={row['ram_pct']}% | gpu={row.get('gpu_util_pct','-')}% vram={row.get('vram_used_mb','-')}MB temp={row.get('gpu_temp_c','-')}C | acc={row.get('acc_status','-')} | core={row['core_alive']} play={row['playback_alive']}")
                 # V3 : auto-stop trigger if ACC has been off for too long (post-session)
+                # Fix 17/05 : exige `acc_seen_live=True` AVANT toute terminaison. Sinon on attend
+                # indéfiniment au boot. Évite le bug de session 49 où perf_monitor s'est terminé
+                # à 00:15:16 alors qu'ACC a démarré après.
                 acc_running = row.get("acc_proc_alive", False) or row.get("acc_shm_ok", False)
-                if not acc_running:
+                if acc_running:
+                    acc_seen_live = True
+                    acc_off_since = 0.0
+                elif acc_seen_live:
+                    # ACC a tourné au moins une fois et est maintenant off → counter peut démarrer
                     if acc_off_since == 0.0:
                         acc_off_since = t_now
                     elif (t_now - acc_off_since) > AUTO_STOP_AFTER_ACC_OFF_S:
-                        print(f"[perf_monitor] ACC off since {AUTO_STOP_AFTER_ACC_OFF_S}s - auto-stop + analyse session")
+                        print(f"[perf_monitor] ACC off since {AUTO_STOP_AFTER_ACC_OFF_S}s post-session - auto-stop + analyse")
                         raise KeyboardInterrupt
-                else:
-                    acc_off_since = 0.0
+                # else : acc_seen_live=False, on attend indéfiniment qu'ACC apparaisse
 
                 # Wait
                 elapsed = time.time() - t_now

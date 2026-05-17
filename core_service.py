@@ -218,6 +218,14 @@ def shm_loop(stop_event: threading.Event):
                     abs_active = snap.get("abs", 0) > 0
                     # Detect sector transition → log previous sector's trace
                     if sec_idx != _state.last_sector_index and _state.last_sector_index >= 0:
+                        # Fix 17/05 B7 : capturer le SECTEUR TIME qui vient de finir pour log_lap_metric.
+                        # ACC SHM expose `last_sector_ms` qui contient le temps du dernier secteur complété.
+                        # On l'append à current_lap_sectors (reset à new lap dans detect_auto_events).
+                        # Avant ce fix : current_lap_sectors restait vide → log_lap_metric écrivait s1/s2/s3=0
+                        # alors que driving_trace avait toute la data détaillée (désync 2 tables).
+                        last_sec_ms = snap.get("last_sector_ms", 0)
+                        if last_sec_ms and last_sec_ms > 0 and len(_state.current_lap_sectors) < 3:
+                            _state.current_lap_sectors.append(int(last_sec_ms))
                         # Sector just changed : log accumulator for the previous sector
                         if _state.session_id and _state.sector_total_frames > 0:
                             try:
@@ -1324,6 +1332,11 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
             return accumulated, None
         return remaining, ready
 
+    # Fix 17/05 B6 : tracker du texte complet à travers tous les hops (chain tools).
+    # Auparavant `final_text` ne contenait que le dernier hop, et avec SPEAK_AS_WE_GO la soustraction
+    # pouvait vider la chaîne → bono_msg='' en DB. Maintenant on accumule TOUT le texte LLM
+    # produit dans la conversation pour le sauver tel quel.
+    _full_response_accumulated = ""
     try:
         for hop in range(3):
             # V2.3 latest-turn-wins (GPT-5.4 P1) : abort if newer PTT arrived since
@@ -1340,6 +1353,9 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
             accumulated_partial = ""
             already_pushed_partial = ""
             seen_tool_use_in_response = False
+            # Fix 17/05 instrumentation : capture TTFT (Time-To-First-Token) — auparavant llm_ttft_ms=0 partout.
+            _ttft_ms_hop = 0
+            _first_delta_ts = None
             with anthropic_client.messages.stream(
                 model=model_id, max_tokens=LLM_MAX_TOKENS, temperature=temperature,
                 system=system_blocks, tools=cached_tools, messages=messages,
@@ -1356,6 +1372,10 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
                         elif event.type == "content_block_delta":
                             d = getattr(event.delta, "text", "") if hasattr(event, "delta") else ""
                             if d:
+                                # TTFT instrumentation : premier delta texte = TTFT
+                                if _first_delta_ts is None:
+                                    _first_delta_ts = time.time()
+                                    _ttft_ms_hop = int((_first_delta_ts - t_llm0) * 1000)
                                 text_chunks.append(d)
                                 # V2.3 D5 — speak as we go : push complete sentences early
                                 if enable_speak_as_we_go and not seen_tool_use_in_response:
@@ -1387,14 +1407,22 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
             _state.metrics["llm_calls"] += 1
             _state.metrics["avg_llm_ms"] = int(0.7 * _state.metrics["avg_llm_ms"] + 0.3 * t_llm)
             tokens_in_total += in_tok; tokens_out_total += out_tok
-            text_str = "".join(text_chunks).strip()
-            # V2.3 D5 : if we pushed partials, remaining text is what wasn't yet pushed
+            text_str_full = "".join(text_chunks).strip()  # Full LLM response (toujours conservé pour DB)
+            # V2.3 D5 : if we pushed partials, remaining text is what wasn't yet pushed (pour TTS final)
+            # Fix 17/05 (B6 audit) : SÉPARER text_str_full (DB) du text_str (TTS).
+            # Avant ce fix : si TOUTE la phrase passait en partials, text_str devenait '' après soustraction
+            # → bono_msg='' en DB (5/8 turns session 49 affectés). Bono parlait mais l'historique
+            # ne savait pas ce qu'il avait dit → contexte multi-turn cassé.
             if enable_speak_as_we_go and already_pushed_partial:
-                # Subtract what was already pushed from full text
-                remaining_text = text_str
-                if already_pushed_partial.strip() in text_str:
-                    remaining_text = text_str.replace(already_pushed_partial.strip(), "", 1).strip()
-                text_str = remaining_text
+                remaining_text = text_str_full
+                if already_pushed_partial.strip() in text_str_full:
+                    remaining_text = text_str_full.replace(already_pushed_partial.strip(), "", 1).strip()
+                text_str = remaining_text  # what's left to send to TTS at end of turn
+            else:
+                text_str = text_str_full
+            # Trace full text across tool hops (pour DB save B6 fix)
+            if text_str_full:
+                _full_response_accumulated = (_full_response_accumulated + " " + text_str_full).strip() if _full_response_accumulated else text_str_full
             if tool_uses_local:
                 # Append assistant message with tool_use blocks
                 messages.append({"role": "assistant", "content": final_msg.content})
@@ -1439,14 +1467,20 @@ def _handle_ptt_llm(transcript: str, turn_id: int, t0: float, push_play, anthrop
                             "cost_usd": round(cost, 5), "turn_id": turn_id}
     logger.info(f"[ptt] turn#{turn_id} response '{final_text[:80]}' tools={tools_used} total={total_ms}ms cost=${cost:.5f}")
     if _state.session_id:
-        memory.log_exchange(_state.session_id, transcript, final_text, model_id, tools_used, tokens_in_total, tokens_out_total, total_ms)
+        # Fix 17/05 B6 : utiliser le texte LLM COMPLET (accumulé sur tous les hops), pas final_text
+        # qui peut être vide après soustraction SPEAK_AS_WE_GO. Fallback sur final_text si l'accumulateur
+        # est vide (cas tools-only sans output texte).
+        full_msg_for_db = _full_response_accumulated if _full_response_accumulated else final_text
+        memory.log_exchange(_state.session_id, transcript, full_msg_for_db, model_id, tools_used, tokens_in_total, tokens_out_total, total_ms)
         # Bug 3 fix : log pipeline_timings per turn (stt/llm/tools/cost breakdown)
         try:
             stt_ms_val = int(snap.get("_t_stt_ms", 0)) if isinstance(snap, dict) else 0
             memory.log_pipeline_timing(
                 session_id=_state.session_id, turn_id=turn_id,
                 stt_ms=stt_ms_val, stt_provider=snap.get("_stt_provider", "deepgram") if isinstance(snap, dict) else "deepgram",
-                llm_ttft_ms=0, llm_total_ms=total_ms, llm_model=model_id,
+                # Fix 17/05 instrumentation : ttft du premier hop (avant tool calls) = vrai TTFT perçu
+                llm_ttft_ms=_ttft_ms_hop if '_ttft_ms_hop' in locals() else 0,
+                llm_total_ms=total_ms, llm_model=model_id,
                 tts_ms=0, tts_provider="elevenlabs", playback_ms=0,
                 total_e2e_ms=total_ms,
                 tools_used=tools_used or [], tools_parallel=len(tools_used or []),
